@@ -1,0 +1,5 @@
+numpy
+PyQt5
+image-registration
+imageio
+pyyaml
