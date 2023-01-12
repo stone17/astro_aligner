@@ -1,6 +1,6 @@
 import os
 import sys
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QFrame, QPushButton, QGridLayout, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem
+from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QLineEdit, QFrame, QPushButton, QGridLayout, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtCore import Qt, QObject, QEvent
 import numpy as np
@@ -37,9 +37,18 @@ class MainWindow(QMainWindow):
         btn_register = QPushButton('Register images', self)
         btn_register.clicked.connect(self.registerImages)
 
-        # Create a button to register the images
+        # Create a button to save the images
         btn_save = QPushButton('Save images', self)
         btn_save.clicked.connect(self.saveImages)
+
+        # Create a button to save the images
+        btn_morph = QPushButton('Morph images', self)
+        btn_morph.clicked.connect(self.morphImages)
+
+        # Create a button to save the images
+        self.fps = QLineEdit('Frame rate', self)
+        self.fps.setText('5')
+        self.fps.editingFinished.connect(self.check_frame_rate)
 
         # Create a list widget to display the image names
         self.image_list = QListWidget(self)
@@ -60,6 +69,8 @@ class MainWindow(QMainWindow):
         layout_buttons.addWidget(btn_open, 0, 0)
         layout_buttons.addWidget(btn_register, 0, 1)
         layout_buttons.addWidget(btn_save, 0, 2)
+        layout_buttons.addWidget(btn_morph, 0, 3)
+        layout_buttons.addWidget(self.fps, 1, 3)
         layout_images = QHBoxLayout()
         layout_images.addWidget(self.label)
         layout_images.addWidget(self.image_list)
@@ -136,14 +147,55 @@ class MainWindow(QMainWindow):
             print("Loaded {} images".format(len(self.images)))
 
     def saveImages(self):
+        # Check if there are any images
+        if not hasattr(self, 'images'):
+            print("No images were found in the selected folder")
+            return
+
         default_path = self.folder if self.folder else os.getcwd()
         folder = QFileDialog.getExistingDirectory(self, "Select Folder", default_path)
         if folder:
             for idx, image in enumerate(self.images):
                 # Save the Image to a file
-                orig_name = self.image_names[idx]
+                orig_name = self.image_names[idx][:-4]
                 file_name = f"{orig_name}_reg.jpg"
                 imageio.imwrite(os.path.join(folder, file_name), image)
+
+    def morphImages(self):
+        # Check if there are any images
+        if not hasattr(self, 'images'):
+            print("No images were found in the selected folder")
+            return
+
+        default_path = self.folder if self.folder else os.getcwd()
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder", default_path)
+
+        if folder:
+            frame_rate = int(self.fps.text())
+            counter = 1
+            for idx, img1 in enumerate(self.images):
+                if idx == len(self.images) - 1:
+                    break
+
+                img2 = self.images[idx+1]
+
+                # Create an empty array to store the interpolated images
+                interpolated_images = []
+
+                # Interpolate between the two images
+                for i in range(frame_rate - 1):
+                    # Calculate the interpolation factor
+                    alpha = i / (frame_rate - 1)
+                    # Interpolate the pixel values
+                    img = img1 * (1 - alpha) + img2 * alpha
+                    # Convert the interpolated image to 8-bit unsigned integers
+                    img = img.astype(np.uint8)
+                    # save the images to disk
+                    padded_index = str(counter).zfill(3)
+                    print(padded_index)
+                    filename = f'{padded_index}.jpg'
+                    imageio.imwrite(os.path.join(folder, filename), img)
+                    counter += 1
 
     def registerImages(self):
         # Check if a folder has been selected
@@ -180,6 +232,15 @@ class MainWindow(QMainWindow):
             print('Image {} of {}: Xoff: {}, Yoff: {}'.format(idx+1, len(grey_images), xoff, yoff))
             corrected_image = np.roll(self.images[idx], (-int(yoff), -int(xoff)), axis=(0, 1)).copy()
             self.images[idx] = corrected_image
+
+    def check_frame_rate(self):
+        fps = self.fps.text()
+        try:
+            fps = int(fps)
+        except Exception:
+            print("Frame rate needs to be an integer")
+            self.fps.setText('5')
+
 
 class EventFilter(QObject):
     def __init__(self, main_window):
