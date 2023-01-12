@@ -41,5 +41,6 @@ Select the folder where to save the morphed images. Images will be morphed linea
 
 Step 5:
 Generate gif. Navigate to the folder where you saved the morphed images and execute ffmpeg:
-
+```
 ffmpeg -f image2 -i %3d.jpg -vf "fps=15,scale=1280:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -loop 0 output.gif
+```
