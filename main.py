@@ -87,7 +87,7 @@ class MainWindow(QMainWindow):
         # Create a button to save the images
         self.fps = QLineEdit('Frame rate', self)
         self.fps.setText('5')
-        self.fps.editingFinished.connect(self.check_frame_rate)
+        self.fps.editingFinished.connect(partial(self.check_input_is_int, '5'))
 
         # Create a button to save the images
         text_fps = QLabel('Frame rate', self)
@@ -137,13 +137,13 @@ class MainWindow(QMainWindow):
     def init_bottom_frame(self):
         bottom_frame = QFrame(self)
         bottom_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
-        bottom_frame.setMaximumHeight(40)
+        bottom_frame.setMaximumHeight(60)
         bottom_layout = QGridLayout(bottom_frame)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
 
         # Add radio buttons to group and layout
         radio_frame = QFrame(self)
-        radio_layout = QHBoxLayout(radio_frame)
+        radio_layout = QVBoxLayout(radio_frame)
         # Create radio buttons
         self.radio_buttons = {
             'rad_normal': QRadioButton("Original"),
@@ -156,7 +156,7 @@ class MainWindow(QMainWindow):
             radio_layout.addWidget(b)
             b.toggled.connect(self.updatePixmap)
         self.radio_buttons['rad_normal'].setChecked(True)
-        bottom_layout.addWidget(radio_frame)
+        bottom_layout.addWidget(radio_frame, 0, 0, 2, 1)
 
         # Add buttons to shift and rotate image
         shift_buttons = {
@@ -174,6 +174,21 @@ class MainWindow(QMainWindow):
             b.clicked.connect(self.shift_image)
             bottom_layout.addWidget(b, 0, idx)
             idx += 1
+
+        # Add shift and rotation pixel setter
+        shift_txt = QLabel('Shift by [px]:')
+        self.shift_val = QLineEdit('Frame rate', self)
+        self.shift_val.setText('1')
+        self.shift_val.editingFinished.connect(partial(self.check_input_is_int, '1'))
+        bottom_layout.addWidget(shift_txt, 1, 1, 1, 2)
+        bottom_layout.addWidget(self.shift_val, 1, 3, 1, 2)
+
+        rot_txt = QLabel('Rotate by [°]:')
+        self.rot_val = QLineEdit('Frame rate', self)
+        self.rot_val.setText('1')
+        self.rot_val.editingFinished.connect(partial(self.check_input_is_int, '1'))
+        bottom_layout.addWidget(rot_txt, 1, 5)
+        bottom_layout.addWidget(self.rot_val, 1, 6)
 
         self.layout.addWidget(bottom_frame, 2, 0)
 
@@ -305,18 +320,22 @@ class MainWindow(QMainWindow):
     def shift_image(self):
         mode = self.sender().text()
         current_im = self.images[self.current_image_idx]
+
+        shift_val = int(self.shift_val.text())
+        rot_val = int(self.rot_val.text())
+
         if mode == 'Left':
-            current_im = np.roll(current_im, -1, axis=1)
+            current_im = np.roll(current_im, -shift_val, axis=1)
         elif mode == 'Right':
-            current_im = np.roll(current_im, 1, axis=1)
+            current_im = np.roll(current_im, shift_val, axis=1)
         elif mode == 'Up':
-            current_im = np.roll(current_im, -1, axis=0)
+            current_im = np.roll(current_im, -shift_val, axis=0)
         elif mode == 'Down':
-            current_im = np.roll(current_im, 1, axis=0)
+            current_im = np.roll(current_im, shift_val, axis=0)
         elif mode == 'Rotate Left':
-            current_im = image_edit.rotate_image(current_im, -1)
+            current_im = image_edit.rotate_image(current_im, -rot_val)
         elif mode == 'Rotate Right':
-            current_im = image_edit.rotate_image(current_im, 1)
+            current_im = image_edit.rotate_image(current_im, rot_val)
 
         self.images[self.current_image_idx] = current_im
 
@@ -375,7 +394,7 @@ class MainWindow(QMainWindow):
         
         mode = self.sender().text()
         if 'all' in mode:
-            indices = np.range(len(self.images))
+            indices = range(len(self.images))
         else:
             indices = [self.current_image_idx]
 
@@ -397,13 +416,13 @@ class MainWindow(QMainWindow):
 
         self.updatePixmap()
 
-    def check_frame_rate(self):
-        fps = self.fps.text()
+    def check_input_is_int(self, default_value):
+        val = self.sender().text()
         try:
-            fps = int(fps)
+            val = int(val)
         except Exception:
-            print("Frame rate needs to be an integer")
-            self.fps.setText('5')
+            print("Input needs to be an integer")
+            self.sender().setText(default_value)
 
 def on_key_press(event):
     if event.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
