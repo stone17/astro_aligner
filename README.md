@@ -4,6 +4,8 @@ Tool to register lunar (eclipse) images using the image_registration package.
 At the moment only jpg is supported.
 Rotation is not supported.
 
+![Snapshot](https://github.com/stone17/astro_aligner/ezcv/master/snapshot.png?raw=true)
+
 ### Setup
 
 #### Dependencies
