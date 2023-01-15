@@ -1,14 +1,19 @@
 import os
 import sys
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QLineEdit, QFrame, QPushButton, QGridLayout, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QFileDialog, QRadioButton, QLabel, QLineEdit, QFrame, QPushButton,
+    QGridLayout, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QButtonGroup
+)
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtCore import Qt, QObject, QEvent
 import numpy as np
 import yaml
 import imageio
+from functools import partial
 
 from image_registration import chi2_shift
 from image_registration.fft_tools import shift
+import image_editing as image_edit
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -16,6 +21,14 @@ class MainWindow(QMainWindow):
 
         # Set up the user interface
         self.initUI()
+        self.ref_image_idx = 0
+        self.current_image_idx = 0
+        self.installEventFilter(self)
+        self.keyPressEvent = on_key_press
+
+    def on_key_press(event):
+        if event.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
+            print("Arrow key pressed")
 
     def initUI(self):
         # Load the last used folder from the config file, if present
@@ -28,6 +41,24 @@ class MainWindow(QMainWindow):
                         self.folder = config['folder']
             except Exception as e:
                 print(e)
+
+        # Create a central widget and set its layout
+        central_widget = QFrame(self)
+        central_widget.setMinimumWidth(800)
+        central_widget.setMinimumHeight(800)
+        self.layout = QGridLayout(central_widget)
+
+        self.init_buttons()
+        self.init_image_frames()
+        self.init_bottom_frame()
+
+        # Set the central widget of the main window
+        self.setCentralWidget(central_widget)
+
+    def init_buttons(self):
+        button_frame = QFrame(self)
+        button_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        button_frame.setMaximumHeight(70)
 
         # Create a button to open a file dialog
         btn_open = QPushButton('Open folder', self)
@@ -50,73 +81,152 @@ class MainWindow(QMainWindow):
         self.fps.setText('5')
         self.fps.editingFinished.connect(self.check_frame_rate)
 
-        # Create a list widget to display the image names
-        self.image_list = QListWidget(self)
-        self.image_list.setFixedWidth(200)
-        self.image_list.itemClicked.connect(self.updatePixmap)
-        self.image_list.currentItemChanged.connect(self.updatePixmap)
+        # Create a button to save the images
+        text_fps = QLabel('Frame rate', self)
 
-        # Create a label to display the image
-        self.label = QLabel(self)
-        self.label.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
-
-        # Create a central widget and set its layout
-        central_widget = QFrame(self)
-        central_widget.setMinimumWidth(600)
-        central_widget.setMinimumHeight(400)
-        layout = QGridLayout(central_widget)
-        layout_buttons = QGridLayout()
+        layout_buttons = QGridLayout(button_frame)
+        layout_buttons.setContentsMargins(1, 1, 1, 1)
         layout_buttons.addWidget(btn_open, 0, 0)
         layout_buttons.addWidget(btn_register, 0, 1)
         layout_buttons.addWidget(btn_save, 0, 2)
-        layout_buttons.addWidget(btn_morph, 0, 3)
-        layout_buttons.addWidget(self.fps, 1, 3)
-        layout_images = QHBoxLayout()
-        layout_images.addWidget(self.label)
-        layout_images.addWidget(self.image_list)
-        layout.addLayout(layout_buttons, 0, 0)
-        layout.addLayout(layout_images, 1, 0)
+        layout_buttons.addWidget(btn_morph, 0, 3, 1, 2)
+        layout_buttons.addWidget(text_fps, 1, 3)
+        layout_buttons.addWidget(self.fps, 1, 4)
 
-        # Set the central widget of the main window
-        self.setCentralWidget(central_widget)
+        self.layout.addWidget(button_frame, 0, 0)
 
-        # Create an event filter to handle the resizeEvent event
-        event_filter = EventFilter(self.label)
-        # Install the event filter on the main window
-        self.installEventFilter(event_filter)
+    def init_image_frames(self):
+        # Create a list widget to display the image names
+        self.image_list = QListWidget(self)
+        self.image_list.setFixedWidth(200)
+        self.image_list.itemClicked.connect(self.item_changed)
+        self.image_list.currentItemChanged.connect(self.item_changed)
+        self.image_list.itemChanged.connect(self.item_changed)
 
-    def updatePixmap(self, event):
+        # Create a labels to display the images
+        self.ref_image = QLabel(self)
+        self.ref_image.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        text_ref = QLabel('Reference Image', self)
+        text_ref.setAlignment(Qt.AlignCenter)
+        text_ref.setMaximumHeight(20)
+
+        self.current_image = QLabel(self)
+        self.current_image.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        text_current = QLabel('Current Image', self)
+        text_current.setAlignment(Qt.AlignCenter)
+        text_current.setMaximumHeight(20)
+        layout_images = QGridLayout()
+        layout_images.addWidget(text_ref, 0, 0)
+        layout_images.addWidget(self.ref_image, 1, 0)
+        layout_images.addWidget(text_current, 2, 0)
+        layout_images.addWidget(self.current_image, 3, 0)
+        layout_images.addWidget(self.image_list, 0, 1, 4, 1)
+
+        self.layout.addLayout(layout_images, 1, 0)
+
+    def init_bottom_frame(self):
+        bottom_frame = QFrame(self)
+        bottom_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        bottom_frame.setMaximumHeight(40)
+        bottom_layout = QGridLayout(bottom_frame)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Add radio buttons to group and layout
+        radio_frame = QFrame(self)
+        radio_layout = QHBoxLayout(radio_frame)
+        # Create radio buttons
+        self.radio_buttons = {
+            'rad_normal': QRadioButton("Original"),
+            'rad_diff': QRadioButton("Difference"),
+        }
+        radio_group = QButtonGroup()
+        for button in self.radio_buttons:
+            b = self.radio_buttons[button]
+            radio_group.addButton(b)
+            radio_layout.addWidget(b)
+            b.toggled.connect(self.updatePixmap)
+        self.radio_buttons['rad_normal'].setChecked(True)
+        bottom_layout.addWidget(radio_frame)
+
+        # Add buttons to shift and rotate image
+        shift_buttons = {
+            'btn_left': QPushButton('Left', self),
+            'btn_right': QPushButton('Right', self),
+            'btn_up': QPushButton('Up', self),
+            'btn_down': QPushButton('Down', self),
+            'btn_rot_l': QPushButton('Rotate Left', self),
+            'btn_rot_r': QPushButton('Rotate Right', self),
+        }
+        
+        idx = 1
+        for button in shift_buttons:
+            b = shift_buttons[button]
+            b.clicked.connect(self.shift_image)
+            bottom_layout.addWidget(b, 0, idx)
+            idx += 1
+
+        self.layout.addWidget(bottom_frame, 2, 0)
+
+    def item_changed(self, item):
+        if item is None:
+            return
+
+        self.image_list.blockSignals(True)
+        if item.checkState() == Qt.Checked:
+            for i in range(self.image_list.count()):
+                if self.image_list.item(i) != item:
+                    self.image_list.item(i).setCheckState(Qt.Unchecked)
+                else:
+                    self.ref_image_idx = i
+        else:
+            checked_item_found = False
+            for i in range(self.image_list.count()):
+                if self.image_list.item(i).checkState() == Qt.Checked:
+                    self.ref_image_idx = i
+                    checked_item_found = True
+                    break
+            if not checked_item_found:
+                self.image_list.item(0).setCheckState(Qt.Checked)
+                self.ref_image_idx = 0
+
+        selected_item = self.image_list.currentItem()
+        if selected_item is None:
+            self.current_image_idx = 0
+        else:
+            self.current_image_idx = self.image_list.row(selected_item)
+        self.updatePixmap()
+        self.image_list.blockSignals(False)
+
+    def get_image_data(self):
+        ref_im = self.images[self.ref_image_idx]
+        current_im = self.images[self.current_image_idx].copy()
+
+        if self.radio_buttons['rad_diff'].isChecked():
+            current_im = np.abs(ref_im - current_im)
+
+        return [ref_im, current_im]
+
+    def updatePixmap(self):
         # Check if a folder has been selected and if there are any pixmaps
         if not hasattr(self, 'folder') or not hasattr(self, 'images'):
             return
 
-        selected_item = self.image_list.currentItem()
-        if selected_item is None:
-            index = 0
-        else:
-            index = self.image_list.row(selected_item)
-        image_data = self.images[index]
+        im_data = self.get_image_data()
+        im_labels = [self.ref_image, self.current_image]
+        pixmaps = [self.ref_pixmap, self.current_pixmap]
 
-        # Get the size of the main window and the pixmap
-        if self.pixmap is not None:
-            pixmap_size = self.pixmap.size()
-            window_size = self.size()
-
-            # Check if the size of the main window has changed
-            if window_size != pixmap_size:
-                pass
-
-        # Convert the array to a QImage
-        image = QImage(
-            image_data.data,
-            image_data.shape[1],
-            image_data.shape[0],
-            image_data.strides[0],
-            QImage.Format_RGB888
-        )
-        # Convert the QImage to a QPixmap
-        self.pixmap = QPixmap.fromImage(image)
-        self.label.setPixmap(self.pixmap.scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        for image_data, label, pixmap in zip(im_data, im_labels, pixmaps):
+            # Convert the array to a QImage
+            image = QImage(
+                image_data.data,
+                image_data.shape[1],
+                image_data.shape[0],
+                image_data.strides[0],
+                QImage.Format_RGB888
+            )
+            # Convert the QImage to a QPixmap
+            pixmap = QPixmap.fromImage(image)
+            label.setPixmap(pixmap.scaled(self.ref_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def loadFolder(self):
         # Set the default path for the file dialog to the last used folder, if available
@@ -131,20 +241,32 @@ class MainWindow(QMainWindow):
             self.images = []
             self.image_names = []
             self.image_paths = []
-            self.pixmap = None
-            self.image_list.clear()
+            self.ref_pixmap = None
+            self.current_pixmap = None
             for file in os.listdir(folder):
                 if file.endswith(".jpg") or file.endswith(".JPG"):
                     image_path = os.path.join(folder, file)
                     self.image_names.append(file)
                     self.image_paths.append(image_path)
                     self.images.append(imageio.imread(image_path))
+            # Update the listwidget
+            self.update_list_widget(self.image_names)
             # Check if any images were found
-            if self.images:
-                # Scale the first pixmap to fit the display
-                self.image_list.addItems(self.image_names)
-                self.updatePixmap(None)
+            #if self.images:
+            #    self.updatePixmap(None)
             print("Loaded {} images".format(len(self.images)))
+
+    def update_list_widget(self, items):
+        self.image_list.clear()
+        for idx, item in enumerate(items):
+            list_item = QListWidgetItem(item)
+            list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)
+            list_item.setCheckState(Qt.Unchecked)
+            self.image_list.addItem(list_item)
+            if idx == 0:
+                list_item.setCheckState(Qt.Checked)
+            else:
+                list_item.setCheckState(Qt.Unchecked)
 
     def saveImages(self):
         # Check if there are any images
@@ -160,6 +282,26 @@ class MainWindow(QMainWindow):
                 orig_name = self.image_names[idx][:-4]
                 file_name = f"{orig_name}_reg.jpg"
                 imageio.imwrite(os.path.join(folder, file_name), image)
+
+    def shift_image(self):
+        mode = self.sender().text()
+        current_im = self.images[self.current_image_idx]
+        if mode == 'Left':
+            current_im = np.roll(current_im, -1, axis=1)
+        elif mode == 'Right':
+            current_im = np.roll(current_im, 1, axis=1)
+        elif mode == 'Up':
+            current_im = np.roll(current_im, -1, axis=0)
+        elif mode == 'Down':
+            current_im = np.roll(current_im, 1, axis=0)
+        elif mode == 'Rotate Left':
+            current_im = image_edit.rotate_image(current_im, -1)
+        elif mode == 'Rotate Right':
+            current_im = image_edit.rotate_image(current_im, 1)
+
+        self.images[self.current_image_idx] = current_im
+
+        self.updatePixmap()
 
     def morphImages(self):
         # Check if there are any images
@@ -208,11 +350,10 @@ class MainWindow(QMainWindow):
             print("No images were found in the selected folder")
             return
 
-        selected_item = self.image_list.currentItem()
-        if selected_item is None:
-            ref_index = 0
-        else:
-            ref_index = self.image_list.row(selected_item)
+        for i in range(self.image_list.count()):
+            if self.image_list.item(i).checkState() == Qt.Checked:
+                ref_index = i
+                break
 
         # Convert the images to grayscale
         grey_images = [np.dot(image[...,:3], [0.2989, 0.5870, 0.1140]) for image in self.images]
@@ -241,29 +382,9 @@ class MainWindow(QMainWindow):
             print("Frame rate needs to be an integer")
             self.fps.setText('5')
 
-
-class EventFilter(QObject):
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Resize:
-            # Check if a folder has been selected and if there are any pixmaps
-            if not hasattr(self.main_window, 'folder') or not hasattr(self.main_window, 'pixmaps'):
-                return False
-
-            # Get the size of the main window and the pixmap
-            window_size = self.main_window.size()
-            pixmap_size = self.main_window.pixmaps[0].size()
-
-            # Check if the size of the main window has changed
-            if window_size != pixmap_size:
-                # Scale the first pixmap to fit the display
-                pixmap = self.main_window.pixmaps[0]
-                self.main_window.label.setPixmap(pixmap.scaled(self.main_window.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        return
-
+def on_key_press(event):
+    if event.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
+        print("Arrow key pressed")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
