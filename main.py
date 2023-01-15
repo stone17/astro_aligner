@@ -65,12 +65,20 @@ class MainWindow(QMainWindow):
         btn_open.clicked.connect(self.loadFolder)
 
         # Create a button to register the images
-        btn_register = QPushButton('Register images', self)
-        btn_register.clicked.connect(self.registerImages)
+        btn_register_all = QPushButton('Register all', self)
+        btn_register_all.clicked.connect(self.registerImages)
+
+        # Create a button to register the images
+        btn_register_current = QPushButton('Register current', self)
+        btn_register_current.clicked.connect(self.registerImages)
 
         # Create a button to save the images
-        btn_save = QPushButton('Save images', self)
-        btn_save.clicked.connect(self.saveImages)
+        btn_save_all = QPushButton('Save all', self)
+        btn_save_all.clicked.connect(self.saveImages)
+
+        # Create a button to save the images
+        btn_save_current = QPushButton('Save current', self)
+        btn_save_current.clicked.connect(self.saveImages)
 
         # Create a button to save the images
         btn_morph = QPushButton('Morph images', self)
@@ -87,8 +95,10 @@ class MainWindow(QMainWindow):
         layout_buttons = QGridLayout(button_frame)
         layout_buttons.setContentsMargins(1, 1, 1, 1)
         layout_buttons.addWidget(btn_open, 0, 0)
-        layout_buttons.addWidget(btn_register, 0, 1)
-        layout_buttons.addWidget(btn_save, 0, 2)
+        layout_buttons.addWidget(btn_register_all, 0, 1)
+        layout_buttons.addWidget(btn_register_current, 1, 1)
+        layout_buttons.addWidget(btn_save_all, 0, 2)
+        layout_buttons.addWidget(btn_save_current, 1, 2)
         layout_buttons.addWidget(btn_morph, 0, 3, 1, 2)
         layout_buttons.addWidget(text_fps, 1, 3)
         layout_buttons.addWidget(self.fps, 1, 4)
@@ -276,10 +286,19 @@ class MainWindow(QMainWindow):
 
         default_path = self.folder if self.folder else os.getcwd()
         folder = QFileDialog.getExistingDirectory(self, "Select Folder", default_path)
+
+        mode = self.sender().text()
+        if 'all' in mode:
+            image_list = self.images
+            image_names = self.image_names
+        else:
+            image_list = [self.images[self.current_image_idx]]
+            image_names = [self.image_names[self.current_image_idx]]
+
         if folder:
-            for idx, image in enumerate(self.images):
+            for idx, image in enumerate(image_list):
                 # Save the Image to a file
-                orig_name = self.image_names[idx][:-4]
+                orig_name = image_names[idx][:-4]
                 file_name = f"{orig_name}_reg.jpg"
                 imageio.imwrite(os.path.join(folder, file_name), image)
 
@@ -350,21 +369,23 @@ class MainWindow(QMainWindow):
             print("No images were found in the selected folder")
             return
 
-        for i in range(self.image_list.count()):
-            if self.image_list.item(i).checkState() == Qt.Checked:
-                ref_index = i
-                break
-
         # Convert the images to grayscale
         grey_images = [np.dot(image[...,:3], [0.2989, 0.5870, 0.1140]) for image in self.images]
+        ref_image = grey_images[self.ref_image_idx]
+        
+        mode = self.sender().text()
+        if 'all' in mode:
+            indices = np.range(len(self.images))
+        else:
+            indices = [self.current_image_idx]
 
         # Register the images against the first image
         registered_images = []
-        for idx, image in enumerate(grey_images):
-            if idx == ref_index:
+        for idx in indices:
+            if idx == self.ref_image_idx:
                 continue
             xoff, yoff, exoff, eyoff = chi2_shift(
-                grey_images[ref_index],
+                ref_image,
                 grey_images[idx],
                 1,
                 return_error=True,
@@ -373,6 +394,8 @@ class MainWindow(QMainWindow):
             print('Image {} of {}: Xoff: {}, Yoff: {}'.format(idx+1, len(grey_images), xoff, yoff))
             corrected_image = np.roll(self.images[idx], (-int(yoff), -int(xoff)), axis=(0, 1)).copy()
             self.images[idx] = corrected_image
+
+        self.updatePixmap()
 
     def check_frame_rate(self):
         fps = self.fps.text()
