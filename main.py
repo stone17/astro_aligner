@@ -1,435 +1,710 @@
 import os
 import sys
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QFileDialog, QRadioButton, QLabel, QLineEdit, QFrame, QPushButton,
-    QGridLayout, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QButtonGroup
+    QApplication, QMainWindow, QRadioButton, QLabel, QLineEdit, QFrame, QPushButton,
+    QGridLayout, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QButtonGroup, QMessageBox,
+    QScrollArea
 )
-from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtCore import Qt, QObject, QEvent
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QIntValidator
+from PyQt5.QtCore import Qt, QObject, QEvent, QPoint, QRect
 import numpy as np
 import yaml
-import imageio
 from functools import partial
+import traceback
 
-from image_registration import chi2_shift
-from image_registration.fft_tools import shift
-import image_editing as image_edit
+from file_functions import (loadFolder, saveImages)
+from image_functions import (translate_image, rotate_image, morphImages, registerImages)
+
+# Validator for non-negative integers
+class NonNegativeIntValidator(QIntValidator):
+    def __init__(self, parent=None):
+        super().__init__(0, 2147483647, parent) # Min 0, Max is default max int
+
+    def validate(self, input_str, pos):
+        # Allow empty string during editing
+        if not input_str:
+            return (QIntValidator.Intermediate, input_str, pos)
+        return super().validate(input_str, pos)
 
 class MainWindow(QMainWindow):
+    CONFIG_FILE = 'config.yaml'
+
     def __init__(self):
         super().__init__()
+        self.anchor_rect_img_coords = None
+        self.zoom_factor = 1.0
+        # Cached pixmaps
+        self._ref_base_pixmap = None
+        self._current_base_pixmap = None
+        self._ref_anchor_pixmap = None # Ref pixmap with anchor drawn
+        self._current_diff_pixmap = None # Diff view pixmap
 
-        # Set up the user interface
+        # Config related attributes
+        self.last_load_folder = None
+        self.last_save_folder = None
+        self.last_morph_folder = None
+        self.load_config() # Load config early
+
         self.initUI()
-        self.ref_image_idx = 0
-        self.current_image_idx = 0
-        self.installEventFilter(self)
-        self.keyPressEvent = on_key_press
+        # Initialize indices after UI potentially ready
+        self.ref_image_idx = -1 # Initialize invalid until images loaded
+        self.current_image_idx = -1
 
-    def on_key_press(event):
-        if event.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
-            print("Arrow key pressed")
+    # --- Config Handling ---
+    def load_config(self):
+        if os.path.exists(self.CONFIG_FILE):
+            try:
+                with open(self.CONFIG_FILE, 'r') as f:
+                    config = yaml.safe_load(f)
+                    if config: # Check if config is not None or empty
+                        self.last_load_folder = config.get('last_load_folder', None)
+                        self.last_save_folder = config.get('last_save_folder', None)
+                        self.last_morph_folder = config.get('last_morph_folder', None)
+                        print("Loaded config:", config)
+            except Exception as e:
+                print(f"Error reading config file '{self.CONFIG_FILE}': {e}")
+
+    def save_config(self):
+        config_data = {
+            'last_load_folder': self.last_load_folder,
+            'last_save_folder': self.last_save_folder,
+            'last_morph_folder': self.last_morph_folder,
+            # Add other settings here if needed later
+        }
+        try:
+            with open(self.CONFIG_FILE, 'w') as f:
+                yaml.dump(config_data, f, default_flow_style=False)
+            # print("Config saved.") # Optional confirmation
+        except Exception as e:
+            print(f"Error writing config file '{self.CONFIG_FILE}': {e}")
+
+    # --- UI Init Methods ---
+    def keyPressEvent(self, event):
+        handled = False
+        if self.image_list.hasFocus():
+            current_row = self.image_list.currentRow()
+            key = event.key()
+            if key == Qt.Key_Up and current_row > 0:
+                self.image_list.setCurrentRow(current_row - 1)
+                handled = True
+            elif key == Qt.Key_Down and current_row < self.image_list.count() - 1:
+                self.image_list.setCurrentRow(current_row + 1)
+                handled = True
+        # Check if handled before passing up
+        if not handled:
+            super().keyPressEvent(event)
 
     def initUI(self):
-        # Load the last used folder from the config file, if present
-        self.folder = None
-        if os.path.exists('config.yaml'):
-            try:
-                with open('config.yaml', 'r') as f:
-                    config = yaml.safe_load(f)
-                    if 'folder' in config:
-                        self.folder = config['folder']
-            except Exception as e:
-                print(e)
-
-        # Create a central widget and set its layout
         central_widget = QFrame(self)
-        central_widget.setMinimumWidth(800)
+        central_widget.setMinimumWidth(1100)
         central_widget.setMinimumHeight(800)
         self.layout = QGridLayout(central_widget)
+        self.layout.setContentsMargins(5, 5, 5, 5)
 
         self.init_buttons()
         self.init_image_frames()
-        self.init_bottom_frame()
+        self.init_control_frame()
 
-        # Set the central widget of the main window
         self.setCentralWidget(central_widget)
+        self.setWindowTitle("Image Registration Tool")
 
     def init_buttons(self):
         button_frame = QFrame(self)
-        button_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
-        button_frame.setMaximumHeight(70)
-
-        # Create a button to open a file dialog
-        btn_open = QPushButton('Open folder', self)
-        btn_open.clicked.connect(self.loadFolder)
-
-        # Create a button to register the images
-        btn_register_all = QPushButton('Register all', self)
-        btn_register_all.clicked.connect(self.registerImages)
-
-        # Create a button to register the images
-        btn_register_current = QPushButton('Register current', self)
-        btn_register_current.clicked.connect(self.registerImages)
-
-        # Create a button to save the images
-        btn_save_all = QPushButton('Save all', self)
-        btn_save_all.clicked.connect(self.saveImages)
-
-        # Create a button to save the images
-        btn_save_current = QPushButton('Save current', self)
-        btn_save_current.clicked.connect(self.saveImages)
-
-        # Create a button to save the images
-        btn_morph = QPushButton('Morph images', self)
-        btn_morph.clicked.connect(self.morphImages)
-
-        # Create a button to save the images
-        self.fps = QLineEdit('Frame rate', self)
-        self.fps.setText('5')
-        self.fps.editingFinished.connect(partial(self.check_input_is_int, '5'))
-
-        # Create a button to save the images
-        text_fps = QLabel('Frame rate', self)
-
+        button_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
+        button_frame.setMaximumHeight(80)
         layout_buttons = QGridLayout(button_frame)
-        layout_buttons.setContentsMargins(1, 1, 1, 1)
+        layout_buttons.setContentsMargins(5, 5, 5, 5)
+
+        # Row 1
+        btn_open = QPushButton('Open folder', self)
+        btn_open.setToolTip("Select image folder.")
+        btn_open.clicked.connect(partial(loadFolder, self))
         layout_buttons.addWidget(btn_open, 0, 0)
+
+        btn_register_all = QPushButton('Register all', self)
+        btn_register_all.setToolTip("Register all to reference.")
+        btn_register_all.clicked.connect(partial(registerImages, self))
         layout_buttons.addWidget(btn_register_all, 0, 1)
-        layout_buttons.addWidget(btn_register_current, 1, 1)
+
+        btn_save_all = QPushButton('Save all', self)
+        btn_save_all.setToolTip("Save all images.")
+        btn_save_all.clicked.connect(partial(saveImages, self))
         layout_buttons.addWidget(btn_save_all, 0, 2)
-        layout_buttons.addWidget(btn_save_current, 1, 2)
+
+        btn_morph = QPushButton('Morph images', self)
+        btn_morph.setToolTip("Create morph sequence.")
+        btn_morph.clicked.connect(partial(morphImages, self))
         layout_buttons.addWidget(btn_morph, 0, 3, 1, 2)
+
+        # Row 2
+        btn_register_current = QPushButton('Register current', self)
+        btn_register_current.setToolTip("Register current to reference.")
+        btn_register_current.clicked.connect(partial(registerImages, self))
+        layout_buttons.addWidget(btn_register_current, 1, 1)
+
+        btn_save_current = QPushButton('Save current', self)
+        btn_save_current.setToolTip("Save current image.")
+        btn_save_current.clicked.connect(partial(saveImages, self))
+        layout_buttons.addWidget(btn_save_current, 1, 2)
+
+        text_fps = QLabel('Morph FPS:', self)
+        text_fps.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         layout_buttons.addWidget(text_fps, 1, 3)
+
+        self.fps = QLineEdit('5', self)
+        self.fps.setToolTip("Morph FPS (min 2).")
+        self.fps.setValidator(NonNegativeIntValidator(self))
+        self.fps.editingFinished.connect(partial(self.check_input_is_int, self.fps, 5, min_val=2))
+        self.fps.setMaximumWidth(50)
         layout_buttons.addWidget(self.fps, 1, 4)
 
+        layout_buttons.setColumnStretch(5, 1)
         self.layout.addWidget(button_frame, 0, 0)
 
     def init_image_frames(self):
-        # Create a list widget to display the image names
-        self.image_list = QListWidget(self)
-        self.image_list.setFixedWidth(200)
-        self.image_list.itemClicked.connect(self.item_changed)
-        self.image_list.currentItemChanged.connect(self.item_changed)
-        self.image_list.itemChanged.connect(self.item_changed)
+        image_area_frame = QFrame(self)
+        image_area_layout = QHBoxLayout(image_area_frame)
+        image_area_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Create a labels to display the images
-        self.ref_image = QLabel(self)
-        self.ref_image.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        image_display_frame = QFrame(self)
+        image_display_layout = QGridLayout(image_display_frame)
+        image_display_layout.setContentsMargins(0, 0, 0, 0)
+
         text_ref = QLabel('Reference Image', self)
         text_ref.setAlignment(Qt.AlignCenter)
         text_ref.setMaximumHeight(20)
+        text_ref.setStyleSheet("font-weight: bold;")
+        image_display_layout.addWidget(text_ref, 0, 0)
 
-        self.current_image = QLabel(self)
-        self.current_image.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
         text_current = QLabel('Current Image', self)
         text_current.setAlignment(Qt.AlignCenter)
         text_current.setMaximumHeight(20)
-        layout_images = QGridLayout()
-        layout_images.addWidget(text_ref, 0, 0)
-        layout_images.addWidget(self.ref_image, 1, 0)
-        layout_images.addWidget(text_current, 2, 0)
-        layout_images.addWidget(self.current_image, 3, 0)
-        layout_images.addWidget(self.image_list, 0, 1, 4, 1)
+        text_current.setStyleSheet("font-weight: bold;")
+        image_display_layout.addWidget(text_current, 0, 1)
 
-        self.layout.addLayout(layout_images, 1, 0)
+        self.ref_image = QLabel(self)
+        self.ref_image.setAlignment(Qt.AlignCenter)
+        self.ref_image.setStyleSheet("background-color: #202020;")
 
-    def init_bottom_frame(self):
-        bottom_frame = QFrame(self)
-        bottom_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
-        bottom_frame.setMaximumHeight(60)
-        bottom_layout = QGridLayout(bottom_frame)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        self.current_image = QLabel(self)
+        self.current_image.setAlignment(Qt.AlignCenter)
+        self.current_image.setStyleSheet("background-color: #202020;")
 
-        # Add radio buttons to group and layout
+        self.ref_scroll_area = QScrollArea(self)
+        self.ref_scroll_area.setWidgetResizable(False)
+        self.ref_scroll_area.setWidget(self.ref_image)
+        self.ref_scroll_area.setMinimumSize(350, 350)
+        image_display_layout.addWidget(self.ref_scroll_area, 1, 0)
+
+        self.current_scroll_area = QScrollArea(self)
+        self.current_scroll_area.setWidgetResizable(False)
+        self.current_scroll_area.setWidget(self.current_image)
+        self.current_scroll_area.setMinimumSize(350, 350)
+        image_display_layout.addWidget(self.current_scroll_area, 1, 1)
+
+        zoom_controls_frame = QFrame(self)
+        zoom_controls_layout = QHBoxLayout(zoom_controls_frame)
+        zoom_controls_layout.setContentsMargins(0, 5, 0, 0)
+
+        btn_zoom_out = QPushButton("-", self)
+        btn_zoom_out.setToolTip("Zoom Out")
+        btn_zoom_out.setMaximumWidth(30)
+        btn_zoom_out.clicked.connect(self.zoom_out)
+
+        btn_zoom_in = QPushButton("+", self)
+        btn_zoom_in.setToolTip("Zoom In")
+        btn_zoom_in.setMaximumWidth(30)
+        btn_zoom_in.clicked.connect(self.zoom_in)
+
+        btn_zoom_fit = QPushButton("Fit", self)
+        btn_zoom_fit.setToolTip("Fit image to view")
+        btn_zoom_fit.clicked.connect(self.fit_view)
+
+        btn_zoom_100 = QPushButton("100%", self)
+        btn_zoom_100.setToolTip("Zoom to 100%")
+        btn_zoom_100.clicked.connect(self.zoom_100)
+
+        zoom_controls_layout.addStretch(1)
+        zoom_controls_layout.addWidget(btn_zoom_out)
+        zoom_controls_layout.addWidget(btn_zoom_in)
+        zoom_controls_layout.addWidget(btn_zoom_fit)
+        zoom_controls_layout.addWidget(btn_zoom_100)
+        zoom_controls_layout.addStretch(1)
+
+        image_display_layout.addWidget(zoom_controls_frame, 2, 0, 1, 2)
+
+        list_frame = QFrame(self)
+        list_layout = QVBoxLayout(list_frame)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_label = QLabel("Images (Check = Reference)")
+        list_label.setMaximumHeight(20)
+        list_label.setStyleSheet("font-weight: bold;")
+        self.image_list = QListWidget(self)
+        self.image_list.setFixedWidth(220)
+        self.image_list.itemClicked.connect(self.item_changed)
+        self.image_list.currentItemChanged.connect(self.current_item_changed_slot)
+        self.image_list.itemChanged.connect(self.check_state_changed)
+        list_layout.addWidget(list_label)
+        list_layout.addWidget(self.image_list)
+
+        image_area_layout.addWidget(image_display_frame, 1)
+        image_area_layout.addWidget(list_frame)
+
+        self.layout.addWidget(image_area_frame, 1, 0)
+
+    def init_control_frame(self):
+        control_frame = QFrame(self)
+        control_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
+        control_layout = QHBoxLayout(control_frame)
+        control_layout.setContentsMargins(5, 5, 5, 5)
+
+        # Display Mode
         radio_frame = QFrame(self)
         radio_layout = QVBoxLayout(radio_frame)
-        # Create radio buttons
-        self.radio_buttons = {
-            'rad_normal': QRadioButton("Original"),
-            'rad_diff': QRadioButton("Difference"),
-        }
-        radio_group = QButtonGroup()
-        for button in self.radio_buttons:
-            b = self.radio_buttons[button]
-            radio_group.addButton(b)
-            radio_layout.addWidget(b)
-            b.toggled.connect(self.updatePixmap)
+        radio_layout.setContentsMargins(0,0,0,0)
+        radio_label = QLabel("Display:")
+        radio_label.setStyleSheet("font-weight: bold;")
+        radio_layout.addWidget(radio_label)
+        self.radio_buttons = {'rad_normal': QRadioButton("Original"), 'rad_diff': QRadioButton("Difference")}
+        display_radio_group = QButtonGroup(self)
+        for button in self.radio_buttons.values():
+            display_radio_group.addButton(button)
+            radio_layout.addWidget(button)
+            button.toggled.connect(self.updatePixmap)
         self.radio_buttons['rad_normal'].setChecked(True)
-        bottom_layout.addWidget(radio_frame, 0, 0, 2, 1)
+        radio_layout.addStretch(1)
+        control_layout.addWidget(radio_frame)
 
-        # Add buttons to shift and rotate image
-        shift_buttons = {
-            'btn_left': QPushButton('Left', self),
-            'btn_right': QPushButton('Right', self),
-            'btn_up': QPushButton('Up', self),
-            'btn_down': QPushButton('Down', self),
-            'btn_rot_l': QPushButton('Rotate Left', self),
-            'btn_rot_r': QPushButton('Rotate Right', self),
-        }
-        
-        idx = 1
-        for button in shift_buttons:
-            b = shift_buttons[button]
-            b.clicked.connect(self.shift_image)
-            bottom_layout.addWidget(b, 0, idx)
-            idx += 1
+        # Registration Settings
+        reg_settings_frame = QFrame(self)
+        reg_settings_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        reg_settings_layout = QVBoxLayout(reg_settings_frame)
+        reg_settings_layout.setContentsMargins(5, 5, 5, 5)
+        reg_title = QLabel("Registration Method:")
+        reg_title.setStyleSheet("font-weight: bold;")
+        reg_settings_layout.addWidget(reg_title)
+        self.reg_method_fft_radio = QRadioButton("FFT (Fast, Subpixel)")
+        self.reg_method_fft_radio.setToolTip("Uses image_registration.chi2_shift.\nAnchor area is ignored.")
+        self.reg_method_scan_radio = QRadioButton("Scan SSD (Anchor Required)")
+        self.reg_method_scan_radio.setToolTip("Scans around anchor for minimum difference.\nRequires anchor. Integer shifts only.")
+        self.reg_method_group = QButtonGroup(self)
+        self.reg_method_group.addButton(self.reg_method_fft_radio)
+        self.reg_method_group.addButton(self.reg_method_scan_radio)
+        reg_settings_layout.addWidget(self.reg_method_fft_radio)
+        reg_settings_layout.addWidget(self.reg_method_scan_radio)
+        self.reg_method_fft_radio.setChecked(True) # Default to FFT
+        reg_settings_layout.addStretch(1)
+        control_layout.addWidget(reg_settings_frame)
 
-        # Add shift and rotation pixel setter
-        shift_txt = QLabel('Shift by [px]:')
-        self.shift_val = QLineEdit('Frame rate', self)
-        self.shift_val.setText('1')
-        self.shift_val.editingFinished.connect(partial(self.check_input_is_int, '1'))
-        bottom_layout.addWidget(shift_txt, 1, 1, 1, 2)
-        bottom_layout.addWidget(self.shift_val, 1, 3, 1, 2)
+        # Anchor Area Input
+        anchor_frame = QFrame(self)
+        anchor_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        anchor_layout = QGridLayout(anchor_frame)
+        anchor_layout.setContentsMargins(5, 5, 5, 5)
+        anchor_title = QLabel("Anchor Area (Pixels)")
+        anchor_title.setStyleSheet("font-weight: bold;")
+        anchor_layout.addWidget(anchor_title, 0, 0, 1, 4)
+        self.anchor_x = QLineEdit("0", self)
+        self.anchor_y = QLineEdit("0", self)
+        self.anchor_w = QLineEdit("100", self)
+        self.anchor_h = QLineEdit("100", self)
+        validator = NonNegativeIntValidator(self)
+        self.anchor_x.setValidator(validator)
+        self.anchor_y.setValidator(validator)
+        self.anchor_w.setValidator(validator)
+        self.anchor_h.setValidator(validator)
+        input_width = 50
+        self.anchor_x.setMaximumWidth(input_width)
+        self.anchor_y.setMaximumWidth(input_width)
+        self.anchor_w.setMaximumWidth(input_width)
+        self.anchor_h.setMaximumWidth(input_width)
+        anchor_layout.addWidget(QLabel("X:"), 1, 0)
+        anchor_layout.addWidget(self.anchor_x, 1, 1)
+        anchor_layout.addWidget(QLabel("Y:"), 2, 0)
+        anchor_layout.addWidget(self.anchor_y, 2, 1)
+        anchor_layout.addWidget(QLabel("W:"), 1, 2)
+        anchor_layout.addWidget(self.anchor_w, 1, 3)
+        anchor_layout.addWidget(QLabel("H:"), 2, 2)
+        anchor_layout.addWidget(self.anchor_h, 2, 3)
+        self.btn_apply_anchor = QPushButton("Apply Anchor", self)
+        self.btn_apply_anchor.setToolTip("Validate and apply anchor values.")
+        self.btn_apply_anchor.clicked.connect(self.apply_anchor_from_inputs)
+        anchor_layout.addWidget(self.btn_apply_anchor, 3, 0, 1, 2)
+        self.btn_clear_anchor = QPushButton("Clear Anchor", self)
+        self.btn_clear_anchor.setToolTip("Remove anchor definition.")
+        self.btn_clear_anchor.clicked.connect(self.clear_anchor_area)
+        self.btn_clear_anchor.setEnabled(False)
+        anchor_layout.addWidget(self.btn_clear_anchor, 3, 2, 1, 2)
+        control_layout.addWidget(anchor_frame)
 
-        rot_txt = QLabel('Rotate by [°]:')
-        self.rot_val = QLineEdit('Frame rate', self)
-        self.rot_val.setText('1')
-        self.rot_val.editingFinished.connect(partial(self.check_input_is_int, '1'))
-        bottom_layout.addWidget(rot_txt, 1, 5)
-        bottom_layout.addWidget(self.rot_val, 1, 6)
+        # Manual Adjustment
+        manual_adj_frame = QFrame(self)
+        manual_adj_layout = QGridLayout(manual_adj_frame)
+        manual_adj_layout.setContentsMargins(5,0,5,0)
+        trans_label = QLabel("Manual Translate:")
+        trans_label.setStyleSheet("font-weight: bold;")
+        manual_adj_layout.addWidget(trans_label, 0, 0, 1, 4)
+        btn_left = QPushButton('← Left', self)
+        btn_right = QPushButton('Right →', self)
+        btn_up = QPushButton('↑ Up', self)
+        btn_down = QPushButton('↓ Down', self)
+        btn_left.clicked.connect(partial(translate_image, self, 'Left'))
+        btn_right.clicked.connect(partial(translate_image, self, 'Right'))
+        btn_up.clicked.connect(partial(translate_image, self, 'Up'))
+        btn_down.clicked.connect(partial(translate_image, self, 'Down'))
+        manual_adj_layout.addWidget(btn_up, 1, 1)
+        manual_adj_layout.addWidget(btn_left, 2, 0)
+        manual_adj_layout.addWidget(btn_down, 2, 1)
+        manual_adj_layout.addWidget(btn_right, 2, 2)
+        shift_txt = QLabel('Shift [px]:')
+        self.shift_val = QLineEdit('1', self)
+        self.shift_val.setMaximumWidth(40)
+        self.shift_val.setValidator(NonNegativeIntValidator(self))
+        self.shift_val.editingFinished.connect(partial(self.check_input_is_int, self.shift_val, 1, min_val=1))
+        manual_adj_layout.addWidget(shift_txt, 3, 0, 1, 2)
+        manual_adj_layout.addWidget(self.shift_val, 3, 2, 1, 1)
+        rot_label = QLabel("Manual Rotate:")
+        rot_label.setStyleSheet("font-weight: bold;")
+        manual_adj_layout.addWidget(rot_label, 0, 4, 1, 3)
+        btn_rot_l = QPushButton('↺ CCW', self)
+        btn_rot_r = QPushButton('CW ↻', self)
+        btn_rot_l.clicked.connect(partial(rotate_image, self, 'Left'))
+        btn_rot_r.clicked.connect(partial(rotate_image, self, 'Right'))
+        manual_adj_layout.addWidget(btn_rot_l, 1, 4)
+        manual_adj_layout.addWidget(btn_rot_r, 1, 5)
+        rot_txt = QLabel('Rotate [°]:')
+        self.rot_val = QLineEdit('0.0', self)
+        self.rot_val.setMaximumWidth(50)
+        self.rot_val.editingFinished.connect(partial(self.check_input_is_float, self.rot_val, 0.0))
+        manual_adj_layout.addWidget(rot_txt, 2, 4)
+        manual_adj_layout.addWidget(self.rot_val, 2, 5)
+        manual_adj_layout.setColumnStretch(6, 1)
+        control_layout.addWidget(manual_adj_frame, 1)
 
-        self.layout.addWidget(bottom_frame, 2, 0)
+        self.layout.addWidget(control_frame, 2, 0)
+
+    # --- Zoom Slots ---
+    def zoom_in(self):
+        self.set_zoom(self.zoom_factor * 1.25)
+
+    def zoom_out(self):
+        self.set_zoom(self.zoom_factor / 1.25)
+
+    def zoom_100(self):
+        self.set_zoom(1.0)
+
+    def fit_view(self):
+        if not self._ref_base_pixmap or self._ref_base_pixmap.isNull():
+            self.set_zoom(1.0)
+            return
+
+        vp_size = self.ref_scroll_area.viewport().size()
+        # Add small margin to viewport size for fitting to avoid potential scrollbars appearing
+        margin = 2 # pixels
+        vp_width = max(1, vp_size.width() - margin)
+        vp_height = max(1, vp_size.height() - margin)
+
+        if vp_width <= 0 or vp_height <= 0:
+            self.set_zoom(1.0)
+            return
+
+        pix_size = self._ref_base_pixmap.size()
+        if pix_size.width() <= 0 or pix_size.height() <= 0:
+             self.set_zoom(1.0)
+             return
+
+        w_scale = vp_width / pix_size.width()
+        h_scale = vp_height / pix_size.height()
+        fit_factor = min(w_scale, h_scale)
+
+        self.set_zoom(fit_factor)
+
+    def set_zoom(self, factor):
+        min_zoom = 0.01
+        max_zoom = 16.0
+        new_factor = max(min_zoom, min(max_zoom, factor))
+        if abs(new_factor - self.zoom_factor) > 1e-6:
+            self.zoom_factor = new_factor
+            print(f"Setting zoom factor to: {self.zoom_factor:.3f}")
+            self.updatePixmap(update_base=False)
+
+    # --- Anchor Handling ---
+    def apply_anchor_from_inputs(self):
+        if not hasattr(self, 'images') or not self.images:
+            QMessageBox.warning(self, "No Image", "Load images first.")
+            return
+        if not (0 <= self.ref_image_idx < len(self.images)):
+             QMessageBox.warning(self, "Invalid Reference", "Cannot get ref dims.")
+             return
+        try:
+            img_h, img_w = self.images[self.ref_image_idx].shape[:2]
+            x0 = int(self.anchor_x.text())
+            y0 = int(self.anchor_y.text())
+            w = int(self.anchor_w.text())
+            h = int(self.anchor_h.text())
+            # Validation
+            if w <= 0 or h <= 0:
+                raise ValueError("W/H must be > 0")
+            if x0 < 0 or y0 < 0:
+                raise ValueError("X/Y cannot be negative")
+            if x0 + w > img_w or y0 + h > img_h:
+                raise ValueError("Anchor outside image bounds")
+
+            self.anchor_rect_img_coords = QRect(x0, y0, w, h)
+            print(f"Anchor area applied: {self.anchor_rect_img_coords}")
+            self.btn_clear_anchor.setEnabled(True)
+            self._prepare_anchor_pixmap()
+            self.updatePixmap(update_base=False)
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Input", f"Invalid anchor: {e}")
+        except Exception as e:
+             QMessageBox.critical(self, "Error", f"Error applying anchor: {e}")
+             traceback.print_exc()
+
+    def clear_anchor_area(self):
+        self.anchor_rect_img_coords = None
+        self._ref_anchor_pixmap = None
+        self.anchor_x.setText("0")
+        self.anchor_y.setText("0")
+        self.anchor_w.setText("100")
+        self.anchor_h.setText("100")
+        self.btn_clear_anchor.setEnabled(False)
+        print("Anchor area cleared.")
+        self.updatePixmap(update_base=False)
+
+    # --- List Widget Handling ---
+    def current_item_changed_slot(self, current_item, previous_item):
+        if current_item is None:
+            return
+        self.item_changed(current_item)
+
+    def check_state_changed(self, item):
+        if item.checkState() == Qt.Checked:
+            self.set_reference_item(item)
+        else:
+            checked_items = [self.image_list.item(i) for i in range(self.image_list.count())
+                             if self.image_list.item(i).checkState() == Qt.Checked]
+            if not checked_items and self.image_list.count() > 0:
+                 self.image_list.blockSignals(True)
+                 item.setCheckState(Qt.Checked)
+                 self.image_list.blockSignals(False)
 
     def item_changed(self, item):
         if item is None:
             return
+        new_current_idx = self.image_list.row(item)
+        if new_current_idx != self.current_image_idx:
+            self.current_image_idx = new_current_idx
+            self.updatePixmap(update_base=True)
 
-        self.image_list.blockSignals(True)
-        if item.checkState() == Qt.Checked:
-            for i in range(self.image_list.count()):
-                if self.image_list.item(i) != item:
-                    self.image_list.item(i).setCheckState(Qt.Unchecked)
-                else:
-                    self.ref_image_idx = i
-        else:
-            checked_item_found = False
-            for i in range(self.image_list.count()):
-                if self.image_list.item(i).checkState() == Qt.Checked:
-                    self.ref_image_idx = i
-                    checked_item_found = True
-                    break
-            if not checked_item_found:
-                self.image_list.item(0).setCheckState(Qt.Checked)
-                self.ref_image_idx = 0
+    def set_reference_item(self, ref_item):
+         new_ref_idx = self.image_list.row(ref_item)
+         if new_ref_idx == self.ref_image_idx and ref_item.checkState() == Qt.Checked:
+             return
+         self.image_list.blockSignals(True)
+         ref_item.setCheckState(Qt.Checked)
+         for i in range(self.image_list.count()):
+              item_i = self.image_list.item(i)
+              if item_i != ref_item and item_i.checkState() == Qt.Checked:
+                   item_i.setCheckState(Qt.Unchecked)
+         self.image_list.blockSignals(False)
+         self.ref_image_idx = new_ref_idx
+         self.updatePixmap(update_base=True)
 
-        selected_item = self.image_list.currentItem()
-        if selected_item is None:
-            self.current_image_idx = 0
-        else:
-            self.current_image_idx = self.image_list.row(selected_item)
-        self.updatePixmap()
-        self.image_list.blockSignals(False)
+    # --- Image Data & Display ---
+    def get_image_data(self, get_raw=False):
+        if not hasattr(self, 'images') or not self.images:
+            return None, None
+        num_images = len(self.images)
+        ref_idx_valid = 0 <= self.ref_image_idx < num_images
+        current_idx_valid = 0 <= self.current_image_idx < num_images
+        if not (ref_idx_valid and current_idx_valid):
+            return None, None
 
-    def get_image_data(self):
         ref_im = self.images[self.ref_image_idx]
-        current_im = self.images[self.current_image_idx].copy()
+        current_im_data = self.images[self.current_image_idx]
+        return ref_im, current_im_data # Return raw data
 
+    def _create_base_pixmap(self, image_data):
+        if image_data is None:
+            return None
+        try:
+            img_copy = image_data
+            if not img_copy.flags['C_CONTIGUOUS']:
+                img_copy = np.ascontiguousarray(img_copy)
+            height, width = img_copy.shape[:2]
+            if img_copy.ndim == 3 and img_copy.shape[2] == 3:
+                channel = 3
+                q_format = QImage.Format_RGB888
+            else:
+                print(f"Error: _create_base_pixmap received non-RGB data shape {img_copy.shape}")
+                return None
+            bytes_per_line = channel * width
+            q_image = QImage(img_copy.data, width, height, bytes_per_line, q_format)
+            if q_image.isNull():
+                print("Error: Failed QImage creation")
+                return None
+            return QPixmap.fromImage(q_image)
+        except Exception as e:
+            print(f"Error creating base pixmap: {e}")
+            # traceback.print_exc() # Verbose
+            return None
+
+    def _prepare_base_pixmaps(self):
+        ref_data, current_data = self.get_image_data(get_raw=True)
+        self._ref_base_pixmap = self._create_base_pixmap(ref_data)
+        self._current_base_pixmap = self._create_base_pixmap(current_data)
+        self._prepare_anchor_pixmap()
+
+    def _prepare_anchor_pixmap(self):
+        self._ref_anchor_pixmap = None
+        if self.anchor_rect_img_coords and self._ref_base_pixmap:
+             try:
+                pixmap_to_draw_on = self._ref_base_pixmap.copy()
+                painter = QPainter(pixmap_to_draw_on)
+                pen = QPen(QColor(0, 255, 0, 200))
+                pen.setWidth(2)
+                pen.setStyle(Qt.SolidLine)
+                painter.setPen(pen)
+                painter.drawRect(self.anchor_rect_img_coords)
+                painter.end()
+                self._ref_anchor_pixmap = pixmap_to_draw_on
+             except Exception as e:
+                 print(f"Error drawing anchor: {e}")
+
+    def updatePixmap(self, update_base=True):
+        if update_base:
+            if not hasattr(self, 'images') or not self.images:
+                self.ref_image.clear()
+                self.current_image.clear()
+                self.ref_image.setText("No Image")
+                self.current_image.setText("No Image")
+                self._ref_base_pixmap = None
+                self._current_base_pixmap = None
+                self._ref_anchor_pixmap = None
+                self._current_diff_pixmap = None
+                return
+            self._prepare_base_pixmaps()
+            self._update_diff_pixmap()
+
+        if not self._ref_base_pixmap:
+            self.ref_image.clear()
+            self.ref_image.setText("Error Base Ref")
+        else:
+            source_ref_pixmap = self._ref_anchor_pixmap if self._ref_anchor_pixmap else self._ref_base_pixmap
+            self._apply_zoom_and_set_pixmap(source_ref_pixmap, self.ref_image)
+
+        if not self._current_base_pixmap:
+            self.current_image.clear()
+            self.current_image.setText("Error Base Cur")
+        else:
+            in_diff_mode = self.radio_buttons['rad_diff'].isChecked()
+            source_current_pixmap = self._current_diff_pixmap if in_diff_mode and self._current_diff_pixmap else self._current_base_pixmap
+            self._apply_zoom_and_set_pixmap(source_current_pixmap, self.current_image)
+
+    def _update_diff_pixmap(self):
+        self._current_diff_pixmap = None
         if self.radio_buttons['rad_diff'].isChecked():
-            current_im = np.abs(ref_im - current_im)
+            ref_data, current_data = self.get_image_data(get_raw=True)
+            if ref_data is not None and current_data is not None and ref_data.shape == current_data.shape:
+                diff_im = np.abs(ref_data.astype(np.float32) - current_data.astype(np.float32))
+                diff_im_uint8 = np.clip(diff_im, 0, 255).astype(np.uint8)
+                self._current_diff_pixmap = self._create_base_pixmap(diff_im_uint8)
 
-        return [ref_im, current_im]
-
-    def updatePixmap(self):
-        # Check if a folder has been selected and if there are any pixmaps
-        if not hasattr(self, 'folder') or not hasattr(self, 'images'):
+    def _apply_zoom_and_set_pixmap(self, source_pixmap, label):
+        if source_pixmap is None or source_pixmap.isNull():
+            label.clear()
+            label.setText("Error Source")
             return
+        try:
+            original_size = source_pixmap.size()
+            target_w = int(round(original_size.width() * self.zoom_factor))
+            target_h = int(round(original_size.height() * self.zoom_factor))
+            target_w = max(1, target_w)
+            target_h = max(1, target_h)
+            scaled_pixmap = source_pixmap.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            label.setPixmap(scaled_pixmap)
+            label.adjustSize()
+        except Exception as e:
+            print(f"Error applying zoom: {e}")
+            label.setText("Error Display")
 
-        im_data = self.get_image_data()
-        im_labels = [self.ref_image, self.current_image]
-        pixmaps = [self.ref_pixmap, self.current_pixmap]
-
-        for image_data, label, pixmap in zip(im_data, im_labels, pixmaps):
-            # Convert the array to a QImage
-            image = QImage(
-                image_data.data,
-                image_data.shape[1],
-                image_data.shape[0],
-                image_data.strides[0],
-                QImage.Format_RGB888
-            )
-            # Convert the QImage to a QPixmap
-            pixmap = QPixmap.fromImage(image)
-            label.setPixmap(pixmap.scaled(self.ref_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def loadFolder(self):
-        # Set the default path for the file dialog to the last used folder, if available
-        default_path = self.folder if self.folder else os.getcwd()
-        # Show a file dialog to select a folder
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder", default_path)
-        if folder:
-            # Save the selected folder to the config file
-            with open('config.yaml', 'w') as f:
-                yaml.dump({'folder': folder}, f)
-            # Load the image files from the folder into QPixmaps
-            self.images = []
-            self.image_names = []
-            self.image_paths = []
-            self.ref_pixmap = None
-            self.current_pixmap = None
-            for file in os.listdir(folder):
-                if file.endswith(".jpg") or file.endswith(".JPG"):
-                    image_path = os.path.join(folder, file)
-                    self.image_names.append(file)
-                    self.image_paths.append(image_path)
-                    self.images.append(imageio.imread(image_path))
-            # Update the listwidget
-            self.update_list_widget(self.image_names)
-            # Check if any images were found
-            #if self.images:
-            #    self.updatePixmap(None)
-            print("Loaded {} images".format(len(self.images)))
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
 
     def update_list_widget(self, items):
         self.image_list.clear()
-        for idx, item in enumerate(items):
-            list_item = QListWidgetItem(item)
+        if not items:
+             self.ref_image_idx = -1
+             self.current_image_idx = -1
+             self.updatePixmap()
+             return
+        self.image_list.blockSignals(True)
+        for idx, item_name in enumerate(items):
+            list_item = QListWidgetItem(item_name)
             list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)
-            list_item.setCheckState(Qt.Unchecked)
+            list_item.setCheckState(Qt.Checked if idx == 0 else Qt.Unchecked)
             self.image_list.addItem(list_item)
-            if idx == 0:
-                list_item.setCheckState(Qt.Checked)
-            else:
-                list_item.setCheckState(Qt.Unchecked)
+        self.image_list.blockSignals(False)
+        self.ref_image_idx = 0
+        self.current_image_idx = 0
+        self.image_list.setCurrentRow(0)
+        self.updatePixmap(update_base=True)
 
-    def saveImages(self):
-        # Check if there are any images
-        if not hasattr(self, 'images'):
-            print("No images were found in the selected folder")
-            return
-
-        default_path = self.folder if self.folder else os.getcwd()
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder", default_path)
-
-        mode = self.sender().text()
-        if 'all' in mode:
-            image_list = self.images
-            image_names = self.image_names
-        else:
-            image_list = [self.images[self.current_image_idx]]
-            image_names = [self.image_names[self.current_image_idx]]
-
-        if folder:
-            for idx, image in enumerate(image_list):
-                # Save the Image to a file
-                orig_name = image_names[idx][:-4]
-                file_name = f"{orig_name}_reg.jpg"
-                imageio.imwrite(os.path.join(folder, file_name), image)
-
-    def shift_image(self):
-        mode = self.sender().text()
-        current_im = self.images[self.current_image_idx]
-
-        shift_val = int(self.shift_val.text())
-        rot_val = int(self.rot_val.text())
-
-        if mode == 'Left':
-            current_im = np.roll(current_im, -shift_val, axis=1)
-        elif mode == 'Right':
-            current_im = np.roll(current_im, shift_val, axis=1)
-        elif mode == 'Up':
-            current_im = np.roll(current_im, -shift_val, axis=0)
-        elif mode == 'Down':
-            current_im = np.roll(current_im, shift_val, axis=0)
-        elif mode == 'Rotate Left':
-            current_im = image_edit.rotate_image(current_im, -rot_val)
-        elif mode == 'Rotate Right':
-            current_im = image_edit.rotate_image(current_im, rot_val)
-
-        self.images[self.current_image_idx] = current_im
-
-        self.updatePixmap()
-
-    def morphImages(self):
-        # Check if there are any images
-        if not hasattr(self, 'images'):
-            print("No images were found in the selected folder")
-            return
-
-        default_path = self.folder if self.folder else os.getcwd()
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder", default_path)
-
-        if folder:
-            frame_rate = int(self.fps.text())
-            counter = 1
-            for idx, img1 in enumerate(self.images):
-                if idx == len(self.images) - 1:
-                    break
-
-                img2 = self.images[idx+1]
-
-                # Create an empty array to store the interpolated images
-                interpolated_images = []
-
-                # Interpolate between the two images
-                for i in range(frame_rate - 1):
-                    # Calculate the interpolation factor
-                    alpha = i / (frame_rate - 1)
-                    # Interpolate the pixel values
-                    img = img1 * (1 - alpha) + img2 * alpha
-                    # Convert the interpolated image to 8-bit unsigned integers
-                    img = img.astype(np.uint8)
-                    # save the images to disk
-                    padded_index = str(counter).zfill(3)
-                    print(padded_index)
-                    filename = f'{padded_index}.jpg'
-                    imageio.imwrite(os.path.join(folder, filename), img)
-                    counter += 1
-
-    def registerImages(self):
-        # Check if a folder has been selected
-        if not hasattr(self, 'folder'):
-            print("No folder has been selected")
-            return
-
-        # Check if there are any images
-        if not hasattr(self, 'images'):
-            print("No images were found in the selected folder")
-            return
-
-        # Convert the images to grayscale
-        grey_images = [np.dot(image[...,:3], [0.2989, 0.5870, 0.1140]) for image in self.images]
-        ref_image = grey_images[self.ref_image_idx]
-        
-        mode = self.sender().text()
-        if 'all' in mode:
-            indices = range(len(self.images))
-        else:
-            indices = [self.current_image_idx]
-
-        # Register the images against the first image
-        registered_images = []
-        for idx in indices:
-            if idx == self.ref_image_idx:
-                continue
-            xoff, yoff, exoff, eyoff = chi2_shift(
-                ref_image,
-                grey_images[idx],
-                1,
-                return_error=True,
-                upsample_factor='auto'
-            )
-            print('Image {} of {}: Xoff: {}, Yoff: {}'.format(idx+1, len(grey_images), xoff, yoff))
-            corrected_image = np.roll(self.images[idx], (-int(yoff), -int(xoff)), axis=(0, 1)).copy()
-            self.images[idx] = corrected_image
-
-        self.updatePixmap()
-
-    def check_input_is_int(self, default_value):
-        val = self.sender().text()
+    # --- Input Validation Helpers ---
+    def check_input_is_int(self, line_edit_widget, default_value, min_val=None, max_val=None):
+        # (No change needed, already clean)
+        val_str = line_edit_widget.text()
+        valid = False
         try:
-            val = int(val)
-        except Exception:
-            print("Input needs to be an integer")
-            self.sender().setText(default_value)
+            val = int(val_str)
+            valid = True
+            corrected_val = val
+            if min_val is not None and val < min_val:
+                corrected_val = min_val
+                valid = False
+                print(f"Val >= {min_val}")
+            if max_val is not None and val > max_val:
+                corrected_val = max_val
+                valid = False
+                print(f"Val <= {max_val}")
+            val = corrected_val
+        except ValueError:
+            val = default_value
+            print(f"Input '{val_str}' invalid integer.")
+            valid = False
+        if not valid:
+            line_edit_widget.setText(str(val))
 
-def on_key_press(event):
-    if event.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
-        print("Arrow key pressed")
+    def check_input_is_float(self, line_edit_widget, default_value):
+        # (No change needed, already clean)
+        val_str = line_edit_widget.text().replace(',', '.')
+        valid = False
+        try:
+            val = float(val_str)
+            valid = True
+        except ValueError:
+            val = default_value
+            print(f"Input '{val_str}' invalid float.")
+            valid = False
+        if not valid:
+            line_edit_widget.setText(f"{val:.1f}")
 
+
+# Main execution block
 if __name__ == '__main__':
+    try: # High DPI
+        if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+            QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+            QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    except Exception as e:
+        print(f"High DPI settings error: {e}")
+
     app = QApplication(sys.argv)
+
     window = MainWindow()
+    # Disable FFT if needed
+
     window.show()
     sys.exit(app.exec_())
