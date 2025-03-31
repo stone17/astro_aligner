@@ -131,6 +131,8 @@ class MainWindow(QMainWindow):
         self.ref_image = QLabel(self)
         self.ref_image.setAlignment(Qt.AlignCenter)
         self.ref_image.setStyleSheet("background-color: #202020;")
+        self.ref_image.setMouseTracking(True) # Enable mouse move events
+        self.ref_image.installEventFilter(self)
 
         self.current_image = QLabel(self)
         self.current_image.setAlignment(Qt.AlignCenter)
@@ -421,49 +423,140 @@ class MainWindow(QMainWindow):
             print(f"Setting zoom factor to: {self.zoom_factor:.3f}")
             self.updatePixmap(update_base=False)
 
+    # --- Coordinate Mapping for Mouse Drag ---
+    def map_label_point_to_image_point(self, label_point):
+        """Maps a QPoint from QLabel coordinates to original image coordinates."""
+        if not self._ref_base_pixmap or self._ref_base_pixmap.isNull() or self.zoom_factor <= 1e-9 or label_point is None:
+            print("Cannot map point: Missing data or zero zoom")
+            return None # Cannot map if pixmap/zoom invalid
+
+        original_size = self._ref_base_pixmap.size()
+        img_w = original_size.width()
+        img_h = original_size.height()
+
+        if img_w <= 0 or img_h <= 0:
+            print("Cannot map point: Invalid original image size")
+            return None
+
+        # Coordinates from event.pos() are relative to the QLabel top-left
+        label_x = label_point.x()
+        label_y = label_point.y()
+
+        # Map back using zoom factor
+        img_x = label_x / self.zoom_factor
+        img_y = label_y / self.zoom_factor
+
+        # Clamp to image bounds [0, img_dim]
+        img_x = max(0.0, min(img_w, img_x))
+        img_y = max(0.0, min(img_h, img_y))
+
+        return QPoint(int(round(img_x)), int(round(img_y)))
+
     # --- Anchor Handling ---
+    def _update_anchor_textboxes(self, img_rect):
+        """Updates anchor text boxes based on a QRect in image coordinates."""
+        if img_rect and isinstance(img_rect, QRect):
+            self.anchor_x.setText(str(img_rect.x()))
+            self.anchor_y.setText(str(img_rect.y()))
+            self.anchor_w.setText(str(img_rect.width()))
+            self.anchor_h.setText(str(img_rect.height()))
+        else: # Clear if invalid rect passed
+            self.anchor_x.setText("0")
+            self.anchor_y.setText("0")
+            self.anchor_w.setText("100")
+            self.anchor_h.setText("100")
+
     def apply_anchor_from_inputs(self):
-        if not hasattr(self, 'images') or not self.images:
-            QMessageBox.warning(self, "No Image", "Load images first.")
-            return
-        if not (0 <= self.ref_image_idx < len(self.images)):
-             QMessageBox.warning(self, "Invalid Reference", "Cannot get ref dims.")
-             return
+        if not hasattr(self, 'images') or not self.images: QMessageBox.warning(self, "No Image", "Load images first."); return
+        if not (0 <= self.ref_image_idx < len(self.images)): QMessageBox.warning(self, "Invalid Reference", "Cannot get ref dims."); return
         try:
             img_h, img_w = self.images[self.ref_image_idx].shape[:2]
-            x0 = int(self.anchor_x.text())
-            y0 = int(self.anchor_y.text())
-            w = int(self.anchor_w.text())
-            h = int(self.anchor_h.text())
-            # Validation
-            if w <= 0 or h <= 0:
-                raise ValueError("W/H must be > 0")
-            if x0 < 0 or y0 < 0:
-                raise ValueError("X/Y cannot be negative")
-            if x0 + w > img_w or y0 + h > img_h:
-                raise ValueError("Anchor outside image bounds")
-
+            x0 = int(self.anchor_x.text()); y0 = int(self.anchor_y.text()); w = int(self.anchor_w.text()); h = int(self.anchor_h.text())
+            if w <= 0 or h <= 0: raise ValueError("W/H > 0");
+            if x0 < 0 or y0 < 0: raise ValueError("X/Y >= 0");
+            if x0 + w > img_w or y0 + h > img_h: raise ValueError("Anchor outside bounds")
             self.anchor_rect_img_coords = QRect(x0, y0, w, h)
-            print(f"Anchor area applied: {self.anchor_rect_img_coords}")
+            print(f"Anchor area applied from text: {self.anchor_rect_img_coords}")
             self.btn_clear_anchor.setEnabled(True)
-            self._prepare_anchor_pixmap()
-            self.updatePixmap(update_base=False)
-        except ValueError as e:
-            QMessageBox.warning(self, "Invalid Input", f"Invalid anchor: {e}")
-        except Exception as e:
-             QMessageBox.critical(self, "Error", f"Error applying anchor: {e}")
-             traceback.print_exc()
+            self.is_selecting = False # Ensure dragging state is off
+            self.selection_start_point = None
+            self.selection_end_point = None
+            self._prepare_anchor_pixmap() # Update cached anchor drawing
+            self.updatePixmap(update_base=False) # Redraw
+        except ValueError as e: QMessageBox.warning(self, "Invalid Input", f"Invalid anchor: {e}")
+        except Exception as e: QMessageBox.critical(self, "Error", f"Error applying anchor: {e}"); traceback.print_exc()
 
     def clear_anchor_area(self):
         self.anchor_rect_img_coords = None
         self._ref_anchor_pixmap = None
-        self.anchor_x.setText("0")
-        self.anchor_y.setText("0")
-        self.anchor_w.setText("100")
-        self.anchor_h.setText("100")
+        # Reset mouse drag state as well
+        self.is_selecting = False
+        self.selection_start_point = None
+        self.selection_end_point = None
+        # Reset text boxes
+        self._update_anchor_textboxes(None) # Clears them to defaults
         self.btn_clear_anchor.setEnabled(False)
         print("Anchor area cleared.")
         self.updatePixmap(update_base=False)
+
+    # --- Event Filter for Mouse Drag ---
+    def eventFilter(self, watched, event):
+        # Process events for the reference image label
+        if watched == self.ref_image:
+            # Check if base pixmap exists, otherwise mapping is impossible
+            if not self._ref_base_pixmap or self._ref_base_pixmap.isNull():
+                return super().eventFilter(watched, event) # Pass event up
+
+            # Mouse Press: Start selection
+            if event.type() == QEvent.MouseButtonPress:
+                if event.button() == Qt.LeftButton:
+                    self.selection_start_point = event.pos() # Store label coords
+                    self.selection_end_point = event.pos()
+                    self.is_selecting = True
+                    self.updatePixmap(update_base=False) # Redraw to show selection start/clear old rect
+                    return True # Event handled
+
+            # Mouse Move: Update selection rectangle
+            elif event.type() == QEvent.MouseMove:
+                if self.is_selecting:
+                    self.selection_end_point = event.pos()
+                    self.updatePixmap(update_base=False) # Redraw with temp rect
+                    return True # Event handled
+
+            # Mouse Release: Finalize selection
+            elif event.type() == QEvent.MouseButtonRelease:
+                if event.button() == Qt.LeftButton and self.is_selecting:
+                    self.selection_end_point = event.pos()
+                    self.is_selecting = False
+
+                    # Map selection points (label coords) to image coords
+                    p1_img = self.map_label_point_to_image_point(self.selection_start_point)
+                    p2_img = self.map_label_point_to_image_point(self.selection_end_point)
+
+                    if p1_img and p2_img:
+                        # Create normalized QRect in image coords
+                        img_rect = QRect(p1_img, p2_img).normalized()
+
+                        # Validate size (e.g., minimum 2x2 pixels)
+                        if img_rect.width() > 1 and img_rect.height() > 1:
+                            self.anchor_rect_img_coords = img_rect # Store the result
+                            print(f"Anchor area set by drag: {self.anchor_rect_img_coords}")
+                            self._update_anchor_textboxes(self.anchor_rect_img_coords) # Update text boxes
+                            self.btn_clear_anchor.setEnabled(True)
+                            self._prepare_anchor_pixmap() # Update cache with final rect drawn
+                        else:
+                            print("Selection too small, anchor not set.")
+                            # Optionally clear existing anchor or leave it? Leave it for now.
+                            # self.clear_anchor_area()
+                    else:
+                        print("Could not map selection points to image coordinates.")
+
+                    # Redraw to show final state (solid green or no rect)
+                    self.updatePixmap(update_base=False)
+                    return True # Event handled
+
+        # Pass unhandled events to the base class
+        return super().eventFilter(watched, event)
 
     # --- List Widget Handling ---
     def current_item_changed_slot(self, current_item, previous_item):

@@ -54,6 +54,8 @@ This application solves this by allowing the user to define a specific **anchor 
     # Create a virtual environment (optional but recommended)
     python -m venv venv
     source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+
+    # Install required packages
     pip install -r requirements.txt
     ```
 
