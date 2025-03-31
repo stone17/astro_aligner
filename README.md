@@ -45,7 +45,6 @@ This application solves this by allowing the user to define a specific **anchor 
 * PyYAML (`pip install PyYAML`)
 * image-registration (`pip install image-registration`)
 * Astropy (`pip install astropy`) - *Required for FITS support*
-* `image_editing.py` (Requires separate implementation, assumed available) - *Required for manual rotation*
 
 ## Installation
 
@@ -55,23 +54,15 @@ This application solves this by allowing the user to define a specific **anchor 
     # Create a virtual environment (optional but recommended)
     python -m venv venv
     source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-
-    # Install packages
-    pip install PyQt5 numpy imageio PyYAML image-registration astropy
-    ```
-    Alternatively, create a `requirements.txt` file with the package names (one per line) and run:
-    ```bash
     pip install -r requirements.txt
     ```
-3.  **Place `image_editing.py`:** Ensure the `image_editing.py` file is in the same directory as the main script, or accessible via your Python path if you use manual rotation.
 
 ## Usage
 
 1.  Run the main application script from your terminal:
     ```bash
-    python main_gui.py
+    python main.py
     ```
-    *(Replace `main_gui.py` with the actual name of your main Python script if different).*
 
 2.  **Workflow:**
     * Click "Open folder" to load images.
@@ -88,5 +79,3 @@ This application solves this by allowing the user to define a specific **anchor 
 ## Configuration
 
 The application automatically creates/updates a `config.yaml` file in the same directory. This stores the paths to the last folders used for loading images, saving images, and saving morph sequences.
-
-*(Optional: Add License section)*
