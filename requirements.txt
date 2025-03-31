@@ -3,3 +3,4 @@ PyQt5
 image-registration
 imageio
 pyyaml
+opencv-python

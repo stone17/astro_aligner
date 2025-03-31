@@ -140,11 +140,13 @@ def saveImages(self):
         return
     sender_button = self.sender()
     mode = sender_button.text() if sender_button else 'all'
+    print(sender_button.text())
 
     image_list_to_save, image_names_to_save = [], []
     if 'all' in mode:
-        if not self.images: QMessageBox.warning(self, "No Images", "No images to save.")
-        return
+        if not self.images:
+            QMessageBox.warning(self, "No Images", "No images to save.")
+            return
         image_list_to_save, image_names_to_save = self.images, self.image_names
     else: # Save current
          if not (0 <= self.current_image_idx < len(self.images)):

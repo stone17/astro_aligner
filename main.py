@@ -101,65 +101,11 @@ class MainWindow(QMainWindow):
         self.layout = QGridLayout(central_widget)
         self.layout.setContentsMargins(5, 5, 5, 5)
 
-        self.init_buttons()
         self.init_image_frames()
         self.init_control_frame()
 
         self.setCentralWidget(central_widget)
         self.setWindowTitle("Image Registration Tool")
-
-    def init_buttons(self):
-        button_frame = QFrame(self)
-        button_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
-        button_frame.setMaximumHeight(80)
-        layout_buttons = QGridLayout(button_frame)
-        layout_buttons.setContentsMargins(5, 5, 5, 5)
-
-        # Row 1
-        btn_open = QPushButton('Open folder', self)
-        btn_open.setToolTip("Select image folder.")
-        btn_open.clicked.connect(partial(loadFolder, self))
-        layout_buttons.addWidget(btn_open, 0, 0)
-
-        btn_register_all = QPushButton('Register all', self)
-        btn_register_all.setToolTip("Register all to reference.")
-        btn_register_all.clicked.connect(partial(registerImages, self))
-        layout_buttons.addWidget(btn_register_all, 0, 1)
-
-        btn_save_all = QPushButton('Save all', self)
-        btn_save_all.setToolTip("Save all images.")
-        btn_save_all.clicked.connect(partial(saveImages, self))
-        layout_buttons.addWidget(btn_save_all, 0, 2)
-
-        btn_morph = QPushButton('Morph images', self)
-        btn_morph.setToolTip("Create morph sequence.")
-        btn_morph.clicked.connect(partial(morphImages, self))
-        layout_buttons.addWidget(btn_morph, 0, 3, 1, 2)
-
-        # Row 2
-        btn_register_current = QPushButton('Register current', self)
-        btn_register_current.setToolTip("Register current to reference.")
-        btn_register_current.clicked.connect(partial(registerImages, self))
-        layout_buttons.addWidget(btn_register_current, 1, 1)
-
-        btn_save_current = QPushButton('Save current', self)
-        btn_save_current.setToolTip("Save current image.")
-        btn_save_current.clicked.connect(partial(saveImages, self))
-        layout_buttons.addWidget(btn_save_current, 1, 2)
-
-        text_fps = QLabel('Morph FPS:', self)
-        text_fps.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        layout_buttons.addWidget(text_fps, 1, 3)
-
-        self.fps = QLineEdit('5', self)
-        self.fps.setToolTip("Morph FPS (min 2).")
-        self.fps.setValidator(NonNegativeIntValidator(self))
-        self.fps.editingFinished.connect(partial(self.check_input_is_int, self.fps, 5, min_val=2))
-        self.fps.setMaximumWidth(50)
-        layout_buttons.addWidget(self.fps, 1, 4)
-
-        layout_buttons.setColumnStretch(5, 1)
-        self.layout.addWidget(button_frame, 0, 0)
 
     def init_image_frames(self):
         image_area_frame = QFrame(self)
@@ -202,9 +148,9 @@ class MainWindow(QMainWindow):
         self.current_scroll_area.setMinimumSize(350, 350)
         image_display_layout.addWidget(self.current_scroll_area, 1, 1)
 
-        zoom_controls_frame = QFrame(self)
-        zoom_controls_layout = QHBoxLayout(zoom_controls_frame)
-        zoom_controls_layout.setContentsMargins(0, 5, 0, 0)
+        image_controls_frame = QFrame(self)
+        image_controls_layout = QHBoxLayout(image_controls_frame)
+        image_controls_layout.setContentsMargins(0, 5, 0, 0)
 
         btn_zoom_out = QPushButton("-", self)
         btn_zoom_out.setToolTip("Zoom Out")
@@ -224,17 +170,25 @@ class MainWindow(QMainWindow):
         btn_zoom_100.setToolTip("Zoom to 100%")
         btn_zoom_100.clicked.connect(self.zoom_100)
 
-        zoom_controls_layout.addStretch(1)
-        zoom_controls_layout.addWidget(btn_zoom_out)
-        zoom_controls_layout.addWidget(btn_zoom_in)
-        zoom_controls_layout.addWidget(btn_zoom_fit)
-        zoom_controls_layout.addWidget(btn_zoom_100)
-        zoom_controls_layout.addStretch(1)
+        image_controls_layout.addStretch(1)
+        image_controls_layout.addWidget(btn_zoom_out)
+        image_controls_layout.addWidget(btn_zoom_in)
+        image_controls_layout.addWidget(btn_zoom_fit)
+        image_controls_layout.addWidget(btn_zoom_100)
 
-        image_display_layout.addWidget(zoom_controls_frame, 2, 0, 1, 2)
+        self.radio_buttons = {'rad_normal': QRadioButton("Original"), 'rad_diff': QRadioButton("Difference")}
+        display_radio_group = QButtonGroup(self)
+        for button in self.radio_buttons.values():
+            display_radio_group.addButton(button)
+            image_controls_layout.addWidget(button)
+            button.toggled.connect(self.updatePixmap)
+        self.radio_buttons['rad_normal'].setChecked(True)
+        image_controls_layout.addStretch(1)
+
+        image_display_layout.addWidget(image_controls_frame, 2, 0, 1, 2)
 
         list_frame = QFrame(self)
-        list_layout = QVBoxLayout(list_frame)
+        list_layout = QGridLayout(list_frame)
         list_layout.setContentsMargins(0, 0, 0, 0)
         list_label = QLabel("Images (Check = Reference)")
         list_label.setMaximumHeight(20)
@@ -244,8 +198,23 @@ class MainWindow(QMainWindow):
         self.image_list.itemClicked.connect(self.item_changed)
         self.image_list.currentItemChanged.connect(self.current_item_changed_slot)
         self.image_list.itemChanged.connect(self.check_state_changed)
-        list_layout.addWidget(list_label)
-        list_layout.addWidget(self.image_list)
+        list_layout.addWidget(list_label, 0, 0, 1, 2)
+        list_layout.addWidget(self.image_list, 1, 0, 1, 2)
+
+        btn_open = QPushButton('Open folder', self)
+        btn_open.setToolTip("Select image folder.")
+        btn_open.clicked.connect(partial(loadFolder, self))
+        list_layout.addWidget(btn_open, 2, 0, 1, 2)
+
+        btn_save_all = QPushButton('Save all', self)
+        btn_save_all.setToolTip("Save all images.")
+        btn_save_all.clicked.connect(partial(saveImages, self))
+        list_layout.addWidget(btn_save_all, 3, 0)
+
+        btn_save_current = QPushButton('Save current', self)
+        btn_save_current.setToolTip("Save current image.")
+        btn_save_current.clicked.connect(partial(saveImages, self))
+        list_layout.addWidget(btn_save_current, 3, 1)
 
         image_area_layout.addWidget(image_display_frame, 1)
         image_area_layout.addWidget(list_frame)
@@ -255,34 +224,20 @@ class MainWindow(QMainWindow):
     def init_control_frame(self):
         control_frame = QFrame(self)
         control_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
-        control_layout = QHBoxLayout(control_frame)
+        control_layout = QGridLayout(control_frame)
         control_layout.setContentsMargins(5, 5, 5, 5)
 
-        # Display Mode
-        radio_frame = QFrame(self)
-        radio_layout = QVBoxLayout(radio_frame)
-        radio_layout.setContentsMargins(0,0,0,0)
-        radio_label = QLabel("Display:")
-        radio_label.setStyleSheet("font-weight: bold;")
-        radio_layout.addWidget(radio_label)
-        self.radio_buttons = {'rad_normal': QRadioButton("Original"), 'rad_diff': QRadioButton("Difference")}
-        display_radio_group = QButtonGroup(self)
-        for button in self.radio_buttons.values():
-            display_radio_group.addButton(button)
-            radio_layout.addWidget(button)
-            button.toggled.connect(self.updatePixmap)
-        self.radio_buttons['rad_normal'].setChecked(True)
-        radio_layout.addStretch(1)
-        control_layout.addWidget(radio_frame)
+        #radio_layout.addStretch(1)
+        #control_layout.addWidget(radio_frame)
 
         # Registration Settings
         reg_settings_frame = QFrame(self)
         reg_settings_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
-        reg_settings_layout = QVBoxLayout(reg_settings_frame)
+        reg_settings_layout = QGridLayout(reg_settings_frame)
         reg_settings_layout.setContentsMargins(5, 5, 5, 5)
-        reg_title = QLabel("Registration Method:")
+        reg_title = QLabel("Image Registration:")
         reg_title.setStyleSheet("font-weight: bold;")
-        reg_settings_layout.addWidget(reg_title)
+        reg_settings_layout.addWidget(reg_title, 0, 0, 1, 2)
         self.reg_method_fft_radio = QRadioButton("FFT (Fast, Subpixel)")
         self.reg_method_fft_radio.setToolTip("Uses image_registration.chi2_shift.\nAnchor area is ignored.")
         self.reg_method_scan_radio = QRadioButton("Scan SSD (Anchor Required)")
@@ -290,11 +245,23 @@ class MainWindow(QMainWindow):
         self.reg_method_group = QButtonGroup(self)
         self.reg_method_group.addButton(self.reg_method_fft_radio)
         self.reg_method_group.addButton(self.reg_method_scan_radio)
-        reg_settings_layout.addWidget(self.reg_method_fft_radio)
-        reg_settings_layout.addWidget(self.reg_method_scan_radio)
+        reg_settings_layout.addWidget(self.reg_method_fft_radio, 1, 0, 1, 2)
+        reg_settings_layout.addWidget(self.reg_method_scan_radio, 2, 0, 1, 2)
         self.reg_method_fft_radio.setChecked(True) # Default to FFT
-        reg_settings_layout.addStretch(1)
-        control_layout.addWidget(reg_settings_frame)
+        
+        btn_register_all = QPushButton('Register all', self)
+        btn_register_all.setToolTip("Register all to reference.")
+        btn_register_all.clicked.connect(partial(registerImages, self))
+        
+        reg_settings_layout.addWidget(btn_register_all, 3, 1)
+        
+        btn_register_current = QPushButton('Register current', self)
+        btn_register_current.setToolTip("Register current to reference.")
+        btn_register_current.clicked.connect(partial(registerImages, self))
+        
+        reg_settings_layout.addWidget(btn_register_current, 3, 0)
+        
+        control_layout.addWidget(reg_settings_frame, 0, 0)
 
         # Anchor Area Input
         anchor_frame = QFrame(self)
@@ -335,10 +302,11 @@ class MainWindow(QMainWindow):
         self.btn_clear_anchor.clicked.connect(self.clear_anchor_area)
         self.btn_clear_anchor.setEnabled(False)
         anchor_layout.addWidget(self.btn_clear_anchor, 3, 2, 1, 2)
-        control_layout.addWidget(anchor_frame)
+        control_layout.addWidget(anchor_frame, 0, 1)
 
         # Manual Adjustment
         manual_adj_frame = QFrame(self)
+        manual_adj_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
         manual_adj_layout = QGridLayout(manual_adj_frame)
         manual_adj_layout.setContentsMargins(5,0,5,0)
         trans_label = QLabel("Manual Translate:")
@@ -379,7 +347,32 @@ class MainWindow(QMainWindow):
         manual_adj_layout.addWidget(rot_txt, 2, 4)
         manual_adj_layout.addWidget(self.rot_val, 2, 5)
         manual_adj_layout.setColumnStretch(6, 1)
-        control_layout.addWidget(manual_adj_frame, 1)
+        control_layout.addWidget(manual_adj_frame, 0, 2)
+
+        # Morph images
+        morph_frame = QFrame(self)
+        morph_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        morph_layout = QGridLayout(morph_frame)
+        morph_layout.setContentsMargins(5,0,5,0)
+        morph_label = QLabel("Morphing:")
+        morph_label.setStyleSheet("font-weight: bold;")
+        morph_layout.addWidget(morph_label, 0, 0, 1, 2)
+        btn_morph = QPushButton('Morph images', self)
+        btn_morph.setToolTip("Create morph sequence.")
+        btn_morph.clicked.connect(partial(morphImages, self))
+        morph_layout.addWidget(btn_morph, 1, 0, 1, 1)
+
+        text_fps = QLabel('Morph FPS:', self)
+        text_fps.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        morph_layout.addWidget(text_fps, 2, 0, 1, 1)
+
+        self.fps = QLineEdit('5', self)
+        self.fps.setToolTip("Morph FPS (min 2).")
+        self.fps.setValidator(NonNegativeIntValidator(self))
+        self.fps.editingFinished.connect(partial(self.check_input_is_int, self.fps, 5, min_val=2))
+        self.fps.setMaximumWidth(50)
+        morph_layout.addWidget(self.fps, 3, 0, 1, 1)
+        control_layout.addWidget(morph_frame, 0, 3)
 
         self.layout.addWidget(control_frame, 2, 0)
 
