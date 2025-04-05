@@ -17,12 +17,9 @@ def loadFolder(self):
         self.last_load_folder = folder
         self.save_config()
         # Reset state
-        self.images = []
-        self.image_names = []
-        self.image_paths = []
         self.ref_image_idx = -1
+        self.image_data = []
         self.current_image_idx = -1
-        self.image_list.clear()
         self.clear_anchor_area() # Also clears pixmaps
         self._ref_base_pixmap = None
         self._current_base_pixmap = None
@@ -38,13 +35,19 @@ def loadFolder(self):
 
              load_count = 0
              fail_count = 0
+
+             num_files = 0
              for file in files:
+                if file.lower().endswith((".fits", ".fit", ".fts", ".jpg", ".jpeg", ".png", ".bmp")):
+                    num_files +=1
+             for idx, file in enumerate(files):
                 image_path = os.path.join(folder, file)
                 file_lower = file.lower()
                 img_data = None # Reset before load attempt
 
                 try:
                     if file_lower.endswith((".fits", ".fit", ".fts")):
+                        print(f'File {idx+1:5d}/{num_files:d}', end='\r')
                         if _astropy_check_ok:
                             print(f"Loading FITS file: {file}")
                             with astro_fits.open(image_path, memmap=False) as hdul:
@@ -64,6 +67,7 @@ def loadFolder(self):
                         # else: Astropy not available
 
                     elif file_lower.endswith((".jpg", ".jpeg", ".png", ".bmp")):
+                        print(f'File {idx+1:5d}/{num_files:d}', end='\r')
                         img_data_raw = imageio.imread(image_path)
                         # Convert common formats to RGB uint8
                         if img_data_raw.ndim == 2:
@@ -74,11 +78,13 @@ def loadFolder(self):
                             img_data = img_data_raw.astype(np.uint8)
                         # else: Unsupported shape
 
-                    # --- Append successful load ---
                     if img_data is not None and img_data.ndim==3 and img_data.shape[2]==3 and img_data.dtype==np.uint8:
-                         self.image_names.append(file)
-                         self.image_paths.append(image_path)
-                         self.images.append(img_data)
+                         self.image_data.append({
+                             'name': file,
+                             'path': image_path,
+                             'image': img_data,
+                             'total_rotation': 0.0
+                         })
                          load_count += 1
                     else:
                          # Only count as fail if img_data stayed None or format was wrong
@@ -92,18 +98,19 @@ def loadFolder(self):
                     fail_count += 1
 
              print(f"Loading finished. Loaded: {load_count}, Failed/Skipped: {fail_count}")
-             if not self.images:
+             if not self.image_data: # Check the correct list
                  QMessageBox.warning(self, "Load Failed", "Could not load any valid images.")
                  self.updatePixmap()
              else:
-                 self.update_list_widget(self.image_names)
-                 self.fit_view() # Set initial zoom
-
+                 names_only = [item['name'] for item in self.image_data]
+                 self.update_list_widget(names_only) # Pass only names
+                 self._update_rotation_textbox() # Set initial rotation display
+                 self.fit_view()
         except Exception as e:
              print(f"Error reading folder contents: {e}")
              QMessageBox.critical(self, "Loading Error", f"Error reading image folder:\n{e}")
-             self.update_list_widget([])
              self.updatePixmap()
+             traceback.print_exc() 
 
 # --- FITS Scaling Helper ---
 def _scale_fits_to_uint8(self, data, p_low=1.0, p_high=99.0):
@@ -135,7 +142,7 @@ def _scale_fits_to_uint8(self, data, p_low=1.0, p_high=99.0):
 
 # --- Saving ---
 def saveImages(self):
-    if not hasattr(self, 'images') or not self.images:
+    if not hasattr(self, 'image_data') or not self.image_data:
         QMessageBox.warning(self, "No Images", "No images loaded.")
         return
     sender_button = self.sender()
@@ -144,16 +151,19 @@ def saveImages(self):
 
     image_list_to_save, image_names_to_save = [], []
     if 'all' in mode:
-        if not self.images:
+        if not self.image_data:
             QMessageBox.warning(self, "No Images", "No images to save.")
             return
-        image_list_to_save, image_names_to_save = self.images, self.image_names
+
+        for image in self.image_data:
+            image_list_to_save.append(image['image'])
+            image_names_to_save.append(image['name'])
     else: # Save current
-         if not (0 <= self.current_image_idx < len(self.images)):
+         if not (0 <= self.current_image_idx < len(self.image_data)):
             QMessageBox.warning(self, "Invalid Selection", "Invalid index.")
             return
-         image_list_to_save = [self.images[self.current_image_idx]]
-         image_names_to_save = [self.image_names[self.current_image_idx]]
+         image_list_to_save = [self.image_data[self.current_image_idx]['image']]
+         image_names_to_save = [self.image_data[self.current_image_idx]['name']]
 
     save_filter = "PNG Images (*.png);;JPEG Images (*.jpg *.jpeg);;BMP Images (*.bmp)"
     start_dir = self.last_save_folder if self.last_save_folder and os.path.isdir(self.last_save_folder) else os.getcwd()
@@ -166,14 +176,15 @@ def saveImages(self):
         fileName, selectedFilter = QFileDialog.getSaveFileName(self, save_dialog_title, suggested_filename, save_filter)
         if not fileName: return
         save_folder = os.path.dirname(fileName)
-        if "JPEG" in selectedFilter: save_ext = ".jpg"
-        elif "BMP" in selectedFilter: save_ext = ".bmp"
+        if "JPEG" in selectedFilter:
+            save_ext = ".jpg"
+        elif "BMP" in selectedFilter:
+            save_ext = ".bmp"
         else: save_ext = ".png"
         print(f"Saving all images to folder: {save_folder} as {save_ext}")
     else: # Save current
         save_dialog_title = "Save Current Image As"
-        orig_name, _ = os.path.splitext(image_names_to_save[0])
-        suggested_filename = os.path.join(start_dir, f"{orig_name}_reg.png")
+        suggested_filename = os.path.join(start_dir, f"{image_names_to_save[0]}_reg.png")
         fileName, selectedFilter = QFileDialog.getSaveFileName(self, save_dialog_title, suggested_filename, save_filter)
         if not fileName: return
         save_folder = os.path.dirname(fileName)

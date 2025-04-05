@@ -13,7 +13,12 @@ from functools import partial
 import traceback
 
 from file_functions import (loadFolder, saveImages)
-from image_functions import (translate_image, rotate_image, morphImages, registerImages)
+from image_functions import (
+    translate_image,
+    apply_text_rotation, rotate_image_incremental,
+    morphImages,
+    registerImages, 
+)
 
 # Validator for non-negative integers
 class NonNegativeIntValidator(QIntValidator):
@@ -33,6 +38,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.anchor_rect_img_coords = None
         self.zoom_factor = 1.0
+        self.image_data = []
+
+        # --- Mouse Drag State ---
+        self.selection_start_point = None
+        self.selection_end_point = None
+        self.is_selecting = False
+
         # Cached pixmaps
         self._ref_base_pixmap = None
         self._current_base_pixmap = None
@@ -335,20 +347,24 @@ class MainWindow(QMainWindow):
         manual_adj_layout.addWidget(self.shift_val, 3, 2, 1, 1)
         rot_label = QLabel("Manual Rotate:")
         rot_label.setStyleSheet("font-weight: bold;")
-        manual_adj_layout.addWidget(rot_label, 0, 4, 1, 3)
+        manual_adj_layout.addWidget(rot_label, 0, 4, 1, 4)
         btn_rot_l = QPushButton('↺ CCW', self)
         btn_rot_r = QPushButton('CW ↻', self)
-        btn_rot_l.clicked.connect(partial(rotate_image, self, 'Left'))
-        btn_rot_r.clicked.connect(partial(rotate_image, self, 'Right'))
+        btn_rot_l.clicked.connect(partial(rotate_image_incremental, self, 'Left'))
+        btn_rot_r.clicked.connect(partial(rotate_image_incremental, self, 'Right'))
         manual_adj_layout.addWidget(btn_rot_l, 1, 4)
         manual_adj_layout.addWidget(btn_rot_r, 1, 5)
-        rot_txt = QLabel('Rotate [°]:')
+        rot_txt = QLabel('Total Rot [°]:')
         self.rot_val = QLineEdit('0.0', self)
         self.rot_val.setMaximumWidth(50)
         self.rot_val.editingFinished.connect(partial(self.check_input_is_float, self.rot_val, 0.0))
         manual_adj_layout.addWidget(rot_txt, 2, 4)
         manual_adj_layout.addWidget(self.rot_val, 2, 5)
-        manual_adj_layout.setColumnStretch(6, 1)
+        self.btn_apply_rotation = QPushButton("Apply Rot", self)
+        self.btn_apply_rotation.setToolTip("Apply rotation in text box")
+        self.btn_apply_rotation.clicked.connect(partial(apply_text_rotation, self))
+        manual_adj_layout.addWidget(self.btn_apply_rotation, 2, 6)
+        manual_adj_layout.setColumnStretch(7, 1)
         control_layout.addWidget(manual_adj_frame, 0, 2)
 
         # Morph images
@@ -377,6 +393,14 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(morph_frame, 0, 3)
 
         self.layout.addWidget(control_frame, 2, 0)
+
+    def _update_rotation_textbox(self):
+        """Updates the rotation text box based on the current image's stored rotation."""
+        if 0 <= self.current_image_idx < len(self.image_data):
+             current_rotation = self.image_data[self.current_image_idx]['total_rotation']
+             self.rot_val.setText(f"{current_rotation:.1f}")
+        else:
+             self.rot_val.setText("0.0")
 
     # --- Zoom Slots ---
     def zoom_in(self):
@@ -581,6 +605,7 @@ class MainWindow(QMainWindow):
         new_current_idx = self.image_list.row(item)
         if new_current_idx != self.current_image_idx:
             self.current_image_idx = new_current_idx
+            self._update_rotation_textbox()
             self.updatePixmap(update_base=True)
 
     def set_reference_item(self, ref_item):
@@ -592,30 +617,31 @@ class MainWindow(QMainWindow):
          for i in range(self.image_list.count()):
               item_i = self.image_list.item(i)
               if item_i != ref_item and item_i.checkState() == Qt.Checked:
-                   item_i.setCheckState(Qt.Unchecked)
+                  item_i.setCheckState(Qt.Unchecked)
          self.image_list.blockSignals(False)
          self.ref_image_idx = new_ref_idx
+         self._update_rotation_textbox() # Update rot display
          self.updatePixmap(update_base=True)
 
     # --- Image Data & Display ---
     def get_image_data(self, get_raw=False):
-        if not hasattr(self, 'images') or not self.images:
+        if not hasattr(self, 'image_data') or not self.image_data:
             return None, None
-        num_images = len(self.images)
+        num_images = len(self.image_data)
         ref_idx_valid = 0 <= self.ref_image_idx < num_images
         current_idx_valid = 0 <= self.current_image_idx < num_images
         if not (ref_idx_valid and current_idx_valid):
             return None, None
 
-        ref_im = self.images[self.ref_image_idx]
-        current_im_data = self.images[self.current_image_idx]
+        ref_im = self.image_data[self.ref_image_idx]['image']
+        current_im_data = self.image_data[self.current_image_idx]['image']
         return ref_im, current_im_data # Return raw data
 
-    def _create_base_pixmap(self, image_data):
-        if image_data is None:
+    def _create_base_pixmap(self, image):
+        if image is None:
             return None
         try:
-            img_copy = image_data
+            img_copy = image
             if not img_copy.flags['C_CONTIGUOUS']:
                 img_copy = np.ascontiguousarray(img_copy)
             height, width = img_copy.shape[:2]
@@ -660,7 +686,7 @@ class MainWindow(QMainWindow):
 
     def updatePixmap(self, update_base=True):
         if update_base:
-            if not hasattr(self, 'images') or not self.images:
+            if not hasattr(self, 'image_data') or not self.image_data:
                 self.ref_image.clear()
                 self.current_image.clear()
                 self.ref_image.setText("No Image")
@@ -735,6 +761,7 @@ class MainWindow(QMainWindow):
         self.ref_image_idx = 0
         self.current_image_idx = 0
         self.image_list.setCurrentRow(0)
+        self._update_rotation_textbox()
         self.updatePixmap(update_base=True)
 
     # --- Input Validation Helpers ---
