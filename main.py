@@ -50,6 +50,7 @@ class MainWindow(QMainWindow):
         self._current_base_pixmap = None
         self._ref_anchor_pixmap = None # Ref pixmap with anchor drawn
         self._current_diff_pixmap = None # Diff view pixmap
+        self.show_crosshair = False
 
         # Config related attributes
         self.last_load_folder = None
@@ -189,6 +190,14 @@ class MainWindow(QMainWindow):
         image_controls_layout.addWidget(btn_zoom_in)
         image_controls_layout.addWidget(btn_zoom_fit)
         image_controls_layout.addWidget(btn_zoom_100)
+
+        # --- Add Crosshair Toggle Button ---
+        self.btn_toggle_crosshair = QPushButton("Crosshair", self)
+        self.btn_toggle_crosshair.setToolTip("Toggle crosshair/bullseye overlay on Reference Image")
+        self.btn_toggle_crosshair.setCheckable(True) # Make it a toggle button
+        self.btn_toggle_crosshair.setChecked(self.show_crosshair) # Set initial state
+        self.btn_toggle_crosshair.toggled.connect(self.toggle_crosshair) # Connect signal
+        image_controls_layout.addWidget(self.btn_toggle_crosshair) # Add to layout
 
         self.radio_buttons = {
             'rad_normal': QRadioButton("Original"),
@@ -479,6 +488,14 @@ class MainWindow(QMainWindow):
         img_y = max(0.0, min(img_h, img_y))
 
         return QPoint(int(round(img_x)), int(round(img_y)))
+    
+    # --- Crosshair Toggle Slot ---
+    def toggle_crosshair(self, checked):
+        """Slot connected to the crosshair button's toggled signal."""
+        self.show_crosshair = checked
+        print(f"Crosshair overlay {'enabled' if checked else 'disabled'}")
+        # Trigger redraw only (don't need to reload base images)
+        self.updatePixmap(update_base=False)
 
     # --- Anchor Handling ---
     def _update_anchor_textboxes(self, img_rect):
@@ -516,84 +533,79 @@ class MainWindow(QMainWindow):
             self.anchor_rect_img_coords = QRect(x0, y0, w, h)
             print(f"Anchor area applied from text: {self.anchor_rect_img_coords}")
             self.btn_clear_anchor.setEnabled(True)
-            self.is_selecting = False # Ensure dragging state is off
+            self.is_selecting = False
             self.selection_start_point = None
             self.selection_end_point = None
-            self._prepare_anchor_pixmap() # Update cached anchor drawing
-            self.updatePixmap(update_base=False) # Redraw
+            # self._prepare_anchor_pixmap() # No longer needed
+            self.updatePixmap(update_base=False) # Redraw with new anchor
         except ValueError as e:
             QMessageBox.warning(self, "Invalid Input", f"Invalid anchor: {e}")
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Error applying anchor: {e}"); traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Error applying anchor: {e}")
+            traceback.print_exc()
 
     def clear_anchor_area(self):
         self.anchor_rect_img_coords = None
-        self._ref_anchor_pixmap = None
-        # Reset mouse drag state as well
+        # self._ref_anchor_pixmap = None # No longer needed
         self.is_selecting = False
         self.selection_start_point = None
         self.selection_end_point = None
-        # Reset text boxes
-        self._update_anchor_textboxes(None) # Clears them to defaults
+        self._update_anchor_textboxes(None)
         self.btn_clear_anchor.setEnabled(False)
         print("Anchor area cleared.")
-        self.updatePixmap(update_base=False)
+        self.updatePixmap(update_base=False) # Redraw without anchor
 
     # --- Event Filter for Mouse Drag ---
     def eventFilter(self, watched, event):
         # Process events for the reference image label
         if watched == self.ref_image:
-            # Check if base pixmap exists, otherwise mapping is impossible
+            # Check if base pixmap exists for coordinate mapping
             if not self._ref_base_pixmap or self._ref_base_pixmap.isNull():
-                return super().eventFilter(watched, event) # Pass event up
+                return super().eventFilter(watched, event)
 
-            # Mouse Press: Start selection
+            # --- Mouse Event Handling ---
             if event.type() == QEvent.MouseButtonPress:
                 if event.button() == Qt.LeftButton:
-                    self.selection_start_point = event.pos() # Store label coords
+                    self.selection_start_point = event.pos()
                     self.selection_end_point = event.pos()
                     self.is_selecting = True
-                    self.updatePixmap(update_base=False) # Redraw to show selection start/clear old rect
-                    return True # Event handled
+                    # Redraw immediately to show selection starting
+                    self.updatePixmap(update_base=False)
+                    return True # Consume event
 
-            # Mouse Move: Update selection rectangle
             elif event.type() == QEvent.MouseMove:
                 if self.is_selecting:
                     self.selection_end_point = event.pos()
-                    self.updatePixmap(update_base=False) # Redraw with temp rect
-                    return True # Event handled
+                    # Redraw to update temporary rectangle
+                    self.updatePixmap(update_base=False)
+                    return True # Consume event
 
-            # Mouse Release: Finalize selection
             elif event.type() == QEvent.MouseButtonRelease:
                 if event.button() == Qt.LeftButton and self.is_selecting:
                     self.selection_end_point = event.pos()
-                    self.is_selecting = False
+                    self.is_selecting = False # Selection finished
 
-                    # Map selection points (label coords) to image coords
+                    # Map selection points to image coordinates
                     p1_img = self.map_label_point_to_image_point(self.selection_start_point)
                     p2_img = self.map_label_point_to_image_point(self.selection_end_point)
 
                     if p1_img and p2_img:
-                        # Create normalized QRect in image coords
                         img_rect = QRect(p1_img, p2_img).normalized()
-
-                        # Validate size (e.g., minimum 2x2 pixels)
+                        # Validate size
                         if img_rect.width() > 1 and img_rect.height() > 1:
-                            self.anchor_rect_img_coords = img_rect # Store the result
+                            self.anchor_rect_img_coords = img_rect
                             print(f"Anchor area set by drag: {self.anchor_rect_img_coords}")
-                            self._update_anchor_textboxes(self.anchor_rect_img_coords) # Update text boxes
+                            self._update_anchor_textboxes(self.anchor_rect_img_coords)
                             self.btn_clear_anchor.setEnabled(True)
-                            self._prepare_anchor_pixmap() # Update cache with final rect drawn
                         else:
                             print("Selection too small, anchor not set.")
-                            # Optionally clear existing anchor or leave it? Leave it for now.
-                            # self.clear_anchor_area()
+                            # Keep previous anchor if one existed
                     else:
-                        print("Could not map selection points to image coordinates.")
+                        print("Could not map selection points to image coords.")
 
-                    # Redraw to show final state (solid green or no rect)
+                    # Final redraw after releasing mouse
                     self.updatePixmap(update_base=False)
-                    return True # Event handled
+                    return True # Consume event
 
         # Pass unhandled events to the base class
         return super().eventFilter(watched, event)
@@ -682,26 +694,12 @@ class MainWindow(QMainWindow):
         ref_data, current_data = self.get_image_data(get_raw=True)
         self._ref_base_pixmap = self._create_base_pixmap(ref_data)
         self._current_base_pixmap = self._create_base_pixmap(current_data)
-        self._prepare_anchor_pixmap()
-
-    def _prepare_anchor_pixmap(self):
-        self._ref_anchor_pixmap = None
-        if self.anchor_rect_img_coords and self._ref_base_pixmap:
-             try:
-                pixmap_to_draw_on = self._ref_base_pixmap.copy()
-                painter = QPainter(pixmap_to_draw_on)
-                pen = QPen(QColor(0, 255, 0, 200))
-                pen.setWidth(2)
-                pen.setStyle(Qt.SolidLine)
-                painter.setPen(pen)
-                painter.drawRect(self.anchor_rect_img_coords)
-                painter.end()
-                self._ref_anchor_pixmap = pixmap_to_draw_on
-             except Exception as e:
-                 print(f"Error drawing anchor: {e}")
+        #self._prepare_anchor_pixmap()
 
     def updatePixmap(self, update_base=True):
+        # Updates display, handles drawing selection/anchor/crosshair
         if update_base:
+            # Check if images exist before preparing pixmaps
             if not hasattr(self, 'image_data') or not self.image_data:
                 self.ref_image.clear()
                 self.current_image.clear()
@@ -709,25 +707,80 @@ class MainWindow(QMainWindow):
                 self.current_image.setText("No Image")
                 self._ref_base_pixmap = None
                 self._current_base_pixmap = None
-                self._ref_anchor_pixmap = None
+                self._ref_anchor_pixmap = None # Also clear pre-drawn anchor
                 self._current_diff_pixmap = None
                 return
-            self._prepare_base_pixmaps()
+            # Regenerate base pixmaps from self.image_data
+            self._prepare_base_pixmaps() # This calls _prepare_anchor_pixmap internally now
+            # Update difference view cache
             self._update_diff_pixmap()
 
+
+        # --- Process Reference Image ---
         if not self._ref_base_pixmap:
             self.ref_image.clear()
             self.ref_image.setText("Error Base Ref")
         else:
-            source_ref_pixmap = self._ref_anchor_pixmap if self._ref_anchor_pixmap else self._ref_base_pixmap
-            self._apply_zoom_and_set_pixmap(source_ref_pixmap, self.ref_image)
+            # Start with the base pixmap
+            pixmap_to_draw_on = self._ref_base_pixmap.copy()
+            painter = QPainter(pixmap_to_draw_on)
+            img_w = self._ref_base_pixmap.width()
+            img_h = self._ref_base_pixmap.height()
 
+            # 1. Draw FINAL anchor rectangle (if defined and NOT selecting)
+            if self.anchor_rect_img_coords and not self.is_selecting:
+                pen_anchor = QPen(QColor(0, 255, 0, 200)) # Solid Green
+                pen_anchor.setWidth(2)
+                pen_anchor.setStyle(Qt.SolidLine)
+                painter.setPen(pen_anchor)
+                painter.drawRect(self.anchor_rect_img_coords) # Use image coords
+
+            # 2. Draw TEMP selection rectangle (if selecting) - overlays final anchor during drag
+            if self.is_selecting and self.selection_start_point and self.selection_end_point:
+                p1_img = self.map_label_point_to_image_point(self.selection_start_point)
+                p2_img = self.map_label_point_to_image_point(self.selection_end_point)
+                if p1_img and p2_img:
+                    temp_rect_img = QRect(p1_img, p2_img).normalized()
+                    pen_temp = QPen(QColor(255, 0, 0, 180)) # Dashed Red
+                    pen_temp.setWidth(1)
+                    pen_temp.setStyle(Qt.DashLine)
+                    painter.setPen(pen_temp)
+                    painter.drawRect(temp_rect_img) # Use image coords
+
+            # 3. Draw CROSSHAIR / BULLSEYE (if enabled) - overlays everything else
+            if self.show_crosshair and img_w > 0 and img_h > 0:
+                center_x = img_w // 2
+                center_y = img_h // 2
+                pen_cross = QPen(QColor(255, 0, 0, 200)) # Solid Red
+                pen_cross.setWidth(2) # Thin lines
+                painter.setPen(pen_cross)
+
+                # Crosshair lines (full width/height)
+                painter.drawLine(0, center_y, img_w, center_y) # Horizontal
+                painter.drawLine(center_x, 0, center_x, img_h) # Vertical
+
+                # Concentric Rings (radii relative to image size)
+                min_dim = min(img_w, img_h)
+                # Define radii as percentages or fixed values - adjust as needed
+                radii = [int(min_dim * r) for r in [0.15, 0.50, 0.95]] # Example: 5%, 10%, 15%
+                center_point = QPoint(center_x, center_y)
+                for r in radii:
+                    if r > 0: # Only draw if radius is positive
+                        painter.drawEllipse(center_point, r, r)
+
+            painter.end()
+            # Apply zoom to the pixmap with all drawings
+            self._apply_zoom_and_set_pixmap(pixmap_to_draw_on, self.ref_image)
+
+        # --- Process Current Image ---
         if not self._current_base_pixmap:
             self.current_image.clear()
             self.current_image.setText("Error Base Cur")
         else:
             in_diff_mode = self.radio_buttons['rad_diff'].isChecked()
+            # Select source pixmap for current view (diff or normal)
             source_current_pixmap = self._current_diff_pixmap if in_diff_mode and self._current_diff_pixmap else self._current_base_pixmap
+            # Apply zoom and set it
             self._apply_zoom_and_set_pixmap(source_current_pixmap, self.current_image)
 
     def _update_diff_pixmap(self):
