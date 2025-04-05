@@ -263,6 +263,7 @@ def registerImages(self):
     mode = sender_button.text() if sender_button else 'all'
     use_fft_method = self.reg_method_fft_radio.isChecked()
     use_scan_method = self.reg_method_scan_radio.isChecked()
+    use_scan_rot_method = self.reg_method_scan_rot_radio.isChecked()
 
     print(f"Starting registration using {'FFT' if use_fft_method else 'Scan SSD'} method.")
 
@@ -349,6 +350,7 @@ def registerImages(self):
                 if xoff is not None and yoff is not None: # Check for success
                     shift_y_int = -int(round(yoff))
                     shift_x_int = -int(round(xoff))
+                    rot_angle = 0
                 else:
                     errors += 1 # Error occurred in _register_fft
                     continue # Skip to next image
@@ -364,6 +366,20 @@ def registerImages(self):
                 # _register_scan_ssd prints its own result, just apply the shift
                 shift_y_int = -best_dy
                 shift_x_int = -best_dx
+                rot_angle = 0
+                # Add error handling if _register_scan_ssd could fail (e.g., return None)
+
+            elif use_scan_rot_method:
+                # Anchor validity checked before loop, ref_anchor should exist
+                if ref_anchor is None: # Should not happen if check above worked
+                     print(f"  Internal Error: ref_anchor not prepared for Scan SSD. Skipping image {idx}.")
+                     errors += 1
+                     continue
+
+                best_angle = _register_scan_ssd_rot(self, ref_anchor, current_grey, anchor_details)
+                shift_y_int = 0
+                shift_x_int = 0
+                rot_angle = best_angle
                 # Add error handling if _register_scan_ssd could fail (e.g., return None)
 
             # --- Apply Calculated Shift ---
@@ -381,6 +397,18 @@ def registerImages(self):
                     corrected_image[:, shift_x_int:] = 0 # Right
                 # Update the image in memory
                 self.image_data[idx]['image'] = corrected_image.copy()
+            elif abs(rot_angle) > 0:
+                current_angle = self.image_data[idx]['total_rotation']
+                new_angle = current_angle + rot_angle
+                self.image_data[idx]['total_rotation'] = new_angle
+                if "image_orig" in self.image_data[idx]:
+                    current_image_full_color = self.image_data[idx]['image_orig']
+                else:
+                    self.image_data[idx]['image_orig'] = current_image_full_color.copy()
+                self.image_data[idx]['image'] = _perform_cv_rotation(current_image_full_color, new_angle)
+                print(f"  Applying final rotation (angle:{new_angle})")
+                if idx == self.current_image_idx:
+                    self.rot_val.setText(f"{new_angle:.1f}")
             else:
                 print(f"  Image {idx}: Calculated shift is zero, no change applied.")
 
@@ -416,7 +444,6 @@ def _register_fft(self, ref_grey, current_grey):
             upsample_factor='auto', # Or try 10, 100 etc.
             return_error=True
         )
-        print(f'  FFT Offset Found (X:{xoff:.3f}, Y:{yoff:.3f})')
         return xoff, yoff
     except Exception as fft_err:
         print(f"  Error during FFT registration: {fft_err}")
@@ -474,3 +501,44 @@ def _register_scan_ssd(self, ref_anchor, current_grey, anchor_details):
 
     print(f"  Scan Best Shift Found (dX:{best_dx}, dY:{best_dy}), Min SSD: {min_ssd:.4g}")
     return best_dx, best_dy # Return the shift dx, dy found
+
+def _register_scan_ssd_rot(self, ref_anchor, current_grey, anchor_details):
+    """Registers one image using Scan SSD. Returns (best_dx, best_dy)."""
+    print(f"  Using Scan SSD...")
+    step_size = 0.2
+    scan_range_degrees = 5.0 # Define scan range
+
+    # Extract anchor details
+    anc_x = anchor_details['x']
+    anc_y = anchor_details['y']
+    anc_w = anchor_details['w']
+    anc_h = anchor_details['h']
+
+    y_start = anc_y
+    y_end = y_start + anc_h
+    x_start = anc_x
+    x_end = x_start + anc_w
+
+    img_h, img_w = current_grey.shape # Dimensions of current image
+
+    min_ssd = np.inf
+    best_angle = 0
+
+    # Scan loop
+    for angle in np.arange(-scan_range_degrees, scan_range_degrees + step_size, step_size):
+        rot = _perform_cv_rotation(current_grey, angle)
+        current_rotated_anchor = rot[y_start:y_end, x_start:x_end]
+
+        # Calculate SSD (ensure shapes match - paranoia check)
+        if current_rotated_anchor.shape == ref_anchor.shape:
+            diff = current_rotated_anchor - ref_anchor
+            ssd = np.sum(diff**2)
+            # Update minimum
+            if ssd < min_ssd:
+                min_ssd = ssd
+                best_angle = angle
+        else:
+            print(current_rotated_anchor.shape, ref_anchor.shape)
+
+    print(f"  Scan Best Angle Found (angle:{best_angle}), Min SSD: {min_ssd:.4g}")
+    return best_angle

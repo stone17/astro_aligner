@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QScrollArea
 )
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QIntValidator
-from PyQt5.QtCore import Qt, QObject, QEvent, QPoint, QRect
+from PyQt5.QtCore import Qt, QObject, QEvent, QPoint, QRect, QLine
 import numpy as np
 import yaml
 from functools import partial
@@ -190,7 +190,10 @@ class MainWindow(QMainWindow):
         image_controls_layout.addWidget(btn_zoom_fit)
         image_controls_layout.addWidget(btn_zoom_100)
 
-        self.radio_buttons = {'rad_normal': QRadioButton("Original"), 'rad_diff': QRadioButton("Difference")}
+        self.radio_buttons = {
+            'rad_normal': QRadioButton("Original"),
+            'rad_diff': QRadioButton("Difference"),
+            }
         display_radio_group = QButtonGroup(self)
         for button in self.radio_buttons.values():
             display_radio_group.addButton(button)
@@ -241,9 +244,6 @@ class MainWindow(QMainWindow):
         control_layout = QGridLayout(control_frame)
         control_layout.setContentsMargins(5, 5, 5, 5)
 
-        #radio_layout.addStretch(1)
-        #control_layout.addWidget(radio_frame)
-
         # Registration Settings
         reg_settings_frame = QFrame(self)
         reg_settings_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
@@ -254,13 +254,17 @@ class MainWindow(QMainWindow):
         reg_settings_layout.addWidget(reg_title, 0, 0, 1, 2)
         self.reg_method_fft_radio = QRadioButton("FFT (Fast, Subpixel)")
         self.reg_method_fft_radio.setToolTip("Uses image_registration.chi2_shift.\nAnchor area is ignored.")
-        self.reg_method_scan_radio = QRadioButton("Scan SSD (Anchor Required)")
+        self.reg_method_scan_radio = QRadioButton("Scan Shift")
         self.reg_method_scan_radio.setToolTip("Scans around anchor for minimum difference.\nRequires anchor. Integer shifts only.")
+        self.reg_method_scan_rot_radio = QRadioButton("Scan Rot")
+        self.reg_method_scan_rot_radio.setToolTip("Rotate around anchor for minimum difference.\nRequires anchor.")
         self.reg_method_group = QButtonGroup(self)
         self.reg_method_group.addButton(self.reg_method_fft_radio)
         self.reg_method_group.addButton(self.reg_method_scan_radio)
+        self.reg_method_group.addButton(self.reg_method_scan_rot_radio)
         reg_settings_layout.addWidget(self.reg_method_fft_radio, 1, 0, 1, 2)
-        reg_settings_layout.addWidget(self.reg_method_scan_radio, 2, 0, 1, 2)
+        reg_settings_layout.addWidget(self.reg_method_scan_radio, 2, 0, 1, 1)
+        reg_settings_layout.addWidget(self.reg_method_scan_rot_radio, 2, 1, 1, 1)
         self.reg_method_fft_radio.setChecked(True) # Default to FFT
         
         btn_register_all = QPushButton('Register all', self)
@@ -491,14 +495,24 @@ class MainWindow(QMainWindow):
             self.anchor_h.setText("100")
 
     def apply_anchor_from_inputs(self):
-        if not hasattr(self, 'images') or not self.images: QMessageBox.warning(self, "No Image", "Load images first."); return
-        if not (0 <= self.ref_image_idx < len(self.images)): QMessageBox.warning(self, "Invalid Reference", "Cannot get ref dims."); return
+        if not hasattr(self, 'image_data') or not self.image_data:
+            QMessageBox.warning(self, "No Image", "Load images first.")
+            return
+        if not (0 <= self.ref_image_idx < len(self.image_data)):
+            QMessageBox.warning(self, "Invalid Reference", "Cannot get ref dims.")
+            return
         try:
             img_h, img_w = self.images[self.ref_image_idx].shape[:2]
-            x0 = int(self.anchor_x.text()); y0 = int(self.anchor_y.text()); w = int(self.anchor_w.text()); h = int(self.anchor_h.text())
-            if w <= 0 or h <= 0: raise ValueError("W/H > 0");
-            if x0 < 0 or y0 < 0: raise ValueError("X/Y >= 0");
-            if x0 + w > img_w or y0 + h > img_h: raise ValueError("Anchor outside bounds")
+            x0 = int(self.anchor_x.text())
+            y0 = int(self.anchor_y.text())
+            w = int(self.anchor_w.text())
+            h = int(self.anchor_h.text())
+            if w <= 0 or h <= 0:
+                raise ValueError("W/H > 0");
+            if x0 < 0 or y0 < 0:
+                raise ValueError("X/Y >= 0");
+            if x0 + w > img_w or y0 + h > img_h:
+                raise ValueError("Anchor outside bounds")
             self.anchor_rect_img_coords = QRect(x0, y0, w, h)
             print(f"Anchor area applied from text: {self.anchor_rect_img_coords}")
             self.btn_clear_anchor.setEnabled(True)
@@ -507,8 +521,10 @@ class MainWindow(QMainWindow):
             self.selection_end_point = None
             self._prepare_anchor_pixmap() # Update cached anchor drawing
             self.updatePixmap(update_base=False) # Redraw
-        except ValueError as e: QMessageBox.warning(self, "Invalid Input", f"Invalid anchor: {e}")
-        except Exception as e: QMessageBox.critical(self, "Error", f"Error applying anchor: {e}"); traceback.print_exc()
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Input", f"Invalid anchor: {e}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error applying anchor: {e}"); traceback.print_exc()
 
     def clear_anchor_area(self):
         self.anchor_rect_img_coords = None
