@@ -5,7 +5,6 @@ import traceback
 from image_registration import chi2_shift
 from astropy.io import fits as astro_fits
 import os
-
 from PyQt5.QtWidgets import (QFileDialog, QMessageBox)
 
 # --- Other Actions ---
@@ -264,6 +263,7 @@ def registerImages(self):
     use_fft_method = self.reg_method_fft_radio.isChecked()
     use_scan_method = self.reg_method_scan_radio.isChecked()
     use_scan_rot_method = self.reg_method_scan_rot_radio.isChecked()
+    use_new_test_method = False
 
     print(f"Starting registration using {'FFT' if use_fft_method else 'Scan SSD'} method.")
 
@@ -346,7 +346,7 @@ def registerImages(self):
                     current_grey = current_grey[y_start:y_end, x_start:x_end]
                     ref_grey = ref_anchor
 
-                xoff, yoff = _register_fft(self, ref_grey, current_grey)
+                xoff, yoff = _register_fft(ref_grey, current_grey)
                 if xoff is not None and yoff is not None: # Check for success
                     shift_y_int = -int(round(yoff))
                     shift_x_int = -int(round(xoff))
@@ -362,12 +362,15 @@ def registerImages(self):
                      errors += 1
                      continue
 
-                best_dx, best_dy = _register_scan_ssd(self, ref_anchor, current_grey, anchor_details)
-                # _register_scan_ssd prints its own result, just apply the shift
-                shift_y_int = -best_dy
-                shift_x_int = -best_dx
-                rot_angle = 0
-                # Add error handling if _register_scan_ssd could fail (e.g., return None)
+                xoff, yoff = _register_scan_ssd(self, ref_anchor, current_grey, anchor_details)
+                if xoff is not None and yoff is not None: # Check for success
+                    # _register_scan_ssd prints its own result, just apply the shift
+                    shift_y_int = -yoff
+                    shift_x_int = -xoff
+                    rot_angle = 0
+                else:
+                    errors += 1 # Error occurred in _register_fft
+                    continue # Skip to next image
 
             elif use_scan_rot_method:
                 # Anchor validity checked before loop, ref_anchor should exist
@@ -376,11 +379,30 @@ def registerImages(self):
                      errors += 1
                      continue
 
-                best_angle = _register_scan_ssd_rot(self, ref_anchor, current_grey, anchor_details)
-                shift_y_int = 0
-                shift_x_int = 0
-                rot_angle = best_angle
-                # Add error handling if _register_scan_ssd could fail (e.g., return None)
+                rot_angle = _register_scan_ssd_rot(ref_anchor, current_grey, anchor_details)
+                if rot_angle is None: # Check for success
+                    errors += 1 # Error occurred in _register_fft
+                    continue # Skip to next image
+
+            elif use_new_test_method:
+                if ref_anchor is not None:
+                    # Extract anchor details
+                    y_start = anchor_details['y']
+                    y_end = y_start + anchor_details['h']
+                    x_start = anchor_details['x']
+                    x_end = x_start + anchor_details['w']
+                    current_grey = current_grey[y_start:y_end, x_start:x_end]
+                    ref_grey = ref_anchor
+
+                _register_fft(ref_grey, current_grey)
+                xoff, yoff, angle = _use_new_test_method(ref_grey, current_grey)
+                if xoff is not None and yoff is not None: # Check for success
+                    shift_y_int = int(round(yoff))
+                    shift_x_int = int(round(xoff))
+                    rot_angle = angle
+                else:
+                    errors += 1 # Error occurred in _register_fft
+                    continue # Skip to next image
 
             # --- Apply Calculated Shift ---
             if abs(shift_y_int) > 0 or abs(shift_x_int) > 0:
@@ -432,7 +454,7 @@ def registerImages(self):
     self.updatePixmap(update_base=True)
 
 
-def _register_fft(self, ref_grey, current_grey):
+def _register_fft(ref_grey, current_grey):
     """Registers one image using FFT (chi2_shift). Returns (xoff, yoff) or (None, None)."""
     print(f"  Using FFT (chi2_shift)...")
 
@@ -444,10 +466,11 @@ def _register_fft(self, ref_grey, current_grey):
             upsample_factor='auto', # Or try 10, 100 etc.
             return_error=True
         )
+        print(f"  register fft Result: Shift=(x:{xoff:.2f}, y:{yoff:.2f})")
         return xoff, yoff
     except Exception as fft_err:
         print(f"  Error during FFT registration: {fft_err}")
-        # traceback.print_exc() # Optional detailed traceback
+        traceback.print_exc() # Optional detailed traceback
         return None, None
 
 
@@ -502,7 +525,7 @@ def _register_scan_ssd(self, ref_anchor, current_grey, anchor_details):
     print(f"  Scan Best Shift Found (dX:{best_dx}, dY:{best_dy}), Min SSD: {min_ssd:.4g}")
     return best_dx, best_dy # Return the shift dx, dy found
 
-def _register_scan_ssd_rot(self, ref_anchor, current_grey, anchor_details):
+def _register_scan_ssd_rot(ref_anchor, current_grey, anchor_details):
     """Registers one image using Scan SSD. Returns (best_dx, best_dy)."""
     print(f"  Using Scan SSD...")
     step_size = 0.2

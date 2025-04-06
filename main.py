@@ -762,7 +762,7 @@ class MainWindow(QMainWindow):
                 # Concentric Rings (radii relative to image size)
                 min_dim = min(img_w, img_h)
                 # Define radii as percentages or fixed values - adjust as needed
-                radii = [int(min_dim * r) for r in [0.15, 0.50, 0.95]] # Example: 5%, 10%, 15%
+                radii = [int(min_dim * r) for r in [0.05, 0.10, 0.15, 0.20, 0,25, 0.30, 0.35, 0.40, 0.45]] # Example: 5%, 10%, 15%
                 center_point = QPoint(center_x, center_y)
                 for r in radii:
                     if r > 0: # Only draw if radius is positive

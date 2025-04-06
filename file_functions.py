@@ -175,6 +175,22 @@ def loadFolder(self): # 'self' is the MainWindow instance
                     self.image_data.sort(key=lambda item: item['timestamp'])
                     # Get names AFTER sorting
                     names_only = [item['name'] for item in self.image_data]
+
+                    time_diffs = []
+                    for idx, i in enumerate(self.image_data):
+                        t = i['timestamp']
+                        if idx > 0:
+                            diff = t - t0
+                            time_diffs.append(diff)
+                            if diff == 0.0:
+                                print(f"Files with same time-stamp: {i['name']}, {self.image_data[idx-1]['name']}")
+                        t0 = t
+
+                    diffs = np.asarray(time_diffs)
+                    print(f"Minumimun time steps: {np.min(diffs):.2f}s")
+                    print(f"Average time steps: {np.mean(diffs):.2f}s")
+                    print(f"Maximum time steps: {np.max(diffs):.2f}s")
+
                 else:
                     print("Warning: Not all images have valid timestamps, using original file order.")
                     names_only = [item['name'] for item in self.image_data] # Use original order
@@ -188,7 +204,7 @@ def loadFolder(self): # 'self' is the MainWindow instance
              # Error reading the directory itself
              print(f"Error reading folder contents: {e}")
              QMessageBox.critical(self, "Loading Error", f"Error reading image folder:\n{e}")
-             # traceback.print_exc() # Optional for detailed debug
+             traceback.print_exc() # Optional for detailed debug
              # Ensure UI is cleared / reset
              self.update_list_widget([])
              self.updatePixmap()
