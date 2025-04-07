@@ -26,7 +26,7 @@ This application solves this by allowing the user to define a specific **anchor 
 * **Registration Methods:**
     * **FFT (Fast, Subpixel):** Uses the `image-registration` library (`chi2_shift`) for fast, subpixel alignment. Uses the anchor area if defined for calculation.
     * **Scan Shift SSD (Anchor Required):** Performs a brute-force scan for X/Y shift around an anchor area, minimizing the Sum of Squared Differences (SSD) to find the best integer pixel shift. Requires an anchor area.
-    * **Scan Rot+Shift SSD (Anchor Required):** Performs a combined brute-force scan for rotation *and* X/Y shift around an anchor area, minimizing SSD. Slower but finds rotation and translation simultaneously. Requires an anchor area. *(Note: Ensure this matches the radio button implementation)*
+    * **Scan Rotation SSD (Anchor Required):** Performs a brute-force scan for rotation around an anchor area, minimizing SSD. Slower but can find rotation in certain cases. Requires an anchor area. Rotation is around the image center!
 * **Anchor Area:** Define a specific rectangular region via:
     * Text input (X, Y, Width, Height) and "Apply Anchor".
     * Clicking and dragging on the Reference Image view.
