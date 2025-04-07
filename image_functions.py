@@ -72,62 +72,122 @@ def translate_image(self, direction):
     # Force update of base pixmap for current image as data changed
     self.updatePixmap(update_base=True)
 
+def _extract_transform_params(M):
+    """
+    Extracts translation, rotation angle, and scale from a 2x3 affine matrix.
+
+    Args:
+        M (np.ndarray): A 2x3 affine transformation matrix.
+
+    Returns:
+        tuple: (tx, ty, angle_degrees, scale) or None if matrix is invalid.
+    """
+    if M is None or M.shape != (2, 3):
+        print("Error: Invalid matrix provided.")
+        return None, None, None, None
+
+    # Translation is directly available
+    tx = M[0, 2]
+    ty = M[1, 2]
+
+    # Calculate scale using the length of the first column vector [a, c]
+    # (or second column [b, d], they should be equal for similarity transforms)
+    scale = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
+
+    # Calculate rotation angle using atan2(y, x) = atan2(c, a)
+    # Ensure scale is not zero to avoid division errors
+    if scale < 1e-6:
+        # Cannot determine angle if scale is essentially zero
+        angle_rad = 0.0
+        print("Warning: Scale is near zero, cannot reliably determine angle.")
+    else:
+        angle_rad = np.arctan2(M[1, 0], M[0, 0])
+
+    # Convert angle to degrees
+    angle_deg = np.degrees(angle_rad)
+
+    return tx, ty, angle_deg, scale
+
+
+def apply_M_transformation(self, M):
+    tx, ty, angle_deg, scale = _extract_transform_params(M)
+    self.rot_val.setText(f"{-angle_deg:.1f}")
+    apply_text_rotation(self)
+    
+    shift_x_int = int(round(tx))
+    shift_y_int = int(round(ty))
+    if abs(shift_y_int) > 0 or abs(shift_x_int) > 0:
+        print(f"  Applying final shift (dX:{shift_x_int}, dY:{shift_y_int})")
+        corrected_image = np.roll(self.image_data[self.current_image_idx]['image'], (shift_y_int, shift_x_int), axis=(0, 1))
+        # Fill edges
+        if shift_y_int > 0:
+            corrected_image[:shift_y_int, :] = 0 # Top
+        elif shift_y_int < 0:
+            corrected_image[shift_y_int:, :] = 0 # Bottom
+        if shift_x_int > 0:
+            corrected_image[:, :shift_x_int] = 0 # Left
+        elif shift_x_int < 0:
+            corrected_image[:, shift_x_int:] = 0 # Right
+        # Update the image in memory
+        self.image_data[self.current_image_idx]['image'] = corrected_image.copy()
+    return
+
 def rotate_image_incremental(self, direction):
-            """Applies small incremental rotation via CCW/CW buttons."""
-            if not self.image_data or not (0 <= self.current_image_idx < len(self.image_data)):
-                print("No current image selected for incremental rotation.")
-                return
+    """Applies small incremental rotation via CCW/CW buttons."""
+    if not self.image_data or not (0 <= self.current_image_idx < len(self.image_data)):
+        print("No current image selected for incremental rotation.")
+        return
 
-            current_data = self.image_data[self.current_image_idx]
-            current_total_rotation = current_data.get('total_rotation', 0.0)
-            angle_step = 0.1
-            incremental_angle = -angle_step if direction == 'Left' else angle_step
-            new_total_rotation = current_total_rotation + incremental_angle
+    current_data = self.image_data[self.current_image_idx]
+    current_total_rotation = current_data.get('total_rotation', 0.0)
+    angle_step = 0.1
+    incremental_angle = -angle_step if direction == 'Left' else angle_step
+    new_total_rotation = current_total_rotation + incremental_angle
 
-            print(f"Applying incremental rotation: {incremental_angle:.1f} degrees")
-            self.rot_val.setText(f"{new_total_rotation:.1f}")
-            apply_text_rotation(self)
+    print(f"Applying incremental rotation: {incremental_angle:.1f} degrees")
+    self.rot_val.setText(f"{new_total_rotation:.1f}")
+    apply_text_rotation(self)
 
 def apply_text_rotation(self):
-            """Applies rotation to match the absolute value in the text box."""
-            if not self.image_data or not (0 <= self.current_image_idx < len(self.image_data)):
-                print("No current image selected for applying text rotation.")
-                return
+    """Applies rotation to match the absolute value in the text box."""
+    if not self.image_data or not (0 <= self.current_image_idx < len(self.image_data)):
+        print("No current image selected for applying text rotation.")
+        return
 
-            if not 'image_orig' in self.image_data[self.current_image_idx]:
-                self.image_data[self.current_image_idx]['image_orig'] = self.image_data[self.current_image_idx]['image'].copy()
+    if not 'image_orig' in self.image_data[self.current_image_idx]:
+        self.image_data[self.current_image_idx]['image_orig'] = self.image_data[self.current_image_idx]['image'].copy()
 
-            current_data = self.image_data[self.current_image_idx]
-            current_total_rotation = current_data.get('total_rotation', 0.0)
-            image_to_rotate = current_data.get('image_orig', None)
-            if image_to_rotate is None:
-                return
+    current_data = self.image_data[self.current_image_idx]
+    current_total_rotation = current_data.get('total_rotation', 0.0)
+    image_to_rotate = current_data.get('image_orig', None)
+    if image_to_rotate is None:
+        return
 
-            try:
-                target_rotation = float(self.rot_val.text().replace(',', '.'))
-            except ValueError:
-                QMessageBox.warning(self, "Invalid Input", "Rotation value must be a valid number.")
-                self.rot_val.setText(f"{current_total_rotation:.1f}")
-                return
+    try:
+        target_rotation = float(self.rot_val.text().replace(',', '.'))
+    except ValueError:
+        QMessageBox.warning(self, "Invalid Input", "Rotation value must be a valid number.")
+        self.rot_val.setText(f"{current_total_rotation:.1f}")
+        return
 
-            rotation_to_apply = target_rotation - current_total_rotation
+    rotation_to_apply = target_rotation - current_total_rotation
 
-            if abs(rotation_to_apply) < 1e-4:
-                print("Target rotation matches current. No change.")
-                self.rot_val.setText(f"{current_total_rotation:.1f}")
-                return
+    if abs(rotation_to_apply) < 1e-4:
+        print("Target rotation matches current. No change.")
+        self.rot_val.setText(f"{current_total_rotation:.1f}")
+        return
 
-            print(f"Applying rotation difference: {rotation_to_apply:.1f} degrees (Target: {target_rotation:.1f})")
-            rotated_im = _perform_cv_rotation(image_to_rotate, target_rotation)
+    print(f"Applying rotation difference: {rotation_to_apply:.1f} degrees (Target: {target_rotation:.1f})")
+    rotated_im = _perform_cv_rotation(image_to_rotate, target_rotation)
 
-            if rotated_im is not None:
-                current_data['image'] = rotated_im.astype(np.uint8)
-                current_data['total_rotation'] = target_rotation
-                self.rot_val.setText(f"{target_rotation:.1f}")
-                self.updatePixmap(update_base=True)
-            else:
-                QMessageBox.warning(self, "Rotation Error", "Failed text rotation.")
-                self.rot_val.setText(f"{current_total_rotation:.1f}")
+    if rotated_im is not None:
+        current_data['image'] = rotated_im.astype(np.uint8)
+        current_data['total_rotation'] = target_rotation
+        self.rot_val.setText(f"{target_rotation:.1f}")
+        self.updatePixmap(update_base=True)
+    else:
+        QMessageBox.warning(self, "Rotation Error", "Failed text rotation.")
+        self.rot_val.setText(f"{current_total_rotation:.1f}")
 
 def _perform_cv_rotation(image, angle):
     """Internal helper using OpenCV for rotation."""
@@ -453,6 +513,37 @@ def registerImages(self):
     # Update display, force update of base pixmaps as image data may have changed
     self.updatePixmap(update_base=True)
 
+##################### WIP
+def _apply_translation(image_data, shift_x_int=0, shift_y_int=0):
+     # --- Apply Calculated Shift ---
+    if abs(shift_y_int) > 0 or abs(shift_x_int) > 0:
+        print(f"  Applying final shift (dX:{shift_x_int}, dY:{shift_y_int})")
+        corrected_image = np.roll(image_data['image'], (shift_y_int, shift_x_int), axis=(0, 1))
+        # Fill edges
+        if shift_y_int > 0:
+            corrected_image[:shift_y_int, :] = 0 # Top
+        elif shift_y_int < 0:
+            corrected_image[shift_y_int:, :] = 0 # Bottom
+        if shift_x_int > 0:
+            corrected_image[:, :shift_x_int] = 0 # Left
+        elif shift_x_int < 0:
+            corrected_image[:, shift_x_int:] = 0 # Right
+        # Update the image in memory
+        self.image_data[idx]['image'] = corrected_image.copy()
+    elif abs(rot_angle) > 0:
+        current_angle = image_data[idx]['total_rotation']
+        new_angle = current_angle + rot_angle
+        self.image_data[idx]['total_rotation'] = new_angle
+        if "image_orig" in self.image_data[idx]:
+            current_image_full_color = self.image_data[idx]['image_orig']
+        else:
+            self.image_data[idx]['image_orig'] = current_image_full_color.copy()
+        self.image_data[idx]['image'] = _perform_cv_rotation(current_image_full_color, new_angle)
+        print(f"  Applying final rotation (angle:{new_angle})")
+        if idx == self.current_image_idx:
+            self.rot_val.setText(f"{new_angle:.1f}")
+    else:
+        print(f"  Image {idx}: Calculated shift is zero, no change applied.") 
 
 def _register_fft(ref_grey, current_grey):
     """Registers one image using FFT (chi2_shift). Returns (xoff, yoff) or (None, None)."""
