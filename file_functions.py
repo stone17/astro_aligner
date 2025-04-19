@@ -4,6 +4,7 @@ import numpy as np
 import imageio
 import traceback # For better error reporting
 import time
+from astropy.io import fits as astro_fits
 from datetime import datetime, timezone # Added timezone for robust timestamp conversion
 from PIL import Image
 from PIL.ExifTags import TAGS
@@ -63,26 +64,22 @@ def loadFolder(self): # 'self' is the MainWindow instance
                 try:
                     # --- Load Image Data ---
                     if file_lower.endswith((".fits", ".fit", ".fts")):
-                        if _astropy_check_ok:
-                            with astro_fits.open(image_path, memmap=False) as hdul:
-                                hdu_index = 0
-                                if len(hdul) > 1 and hdul[0].data is None:
-                                    hdu_index = 1
-                                if hdu_index < len(hdul) and hdul[hdu_index].data is not None:
-                                    fits_data = hdul[hdu_index].data
-                                    header = hdul[hdu_index].header # Store header
-                                    if fits_data.ndim > 2:
-                                        # Simple slice, assuming first axis is non-spatial
-                                        fits_data = fits_data[0, :, :]
-                                    img_data_uint8 = _scale_fits_to_uint8(fits_data) # Use helper
-                                    if img_data_uint8 is not None:
-                                        if img_data_uint8.ndim == 2:
-                                            img_data = np.stack((img_data_uint8,) * 3, axis=-1)
-                                        elif img_data_uint8.ndim == 3 and img_data_uint8.shape[2] == 3:
-                                            img_data = img_data_uint8
-                        else:
-                            # Skip if astropy not available
-                            pass # Fail count incremented later if img_data is None
+                        with astro_fits.open(image_path, memmap=False) as hdul:
+                            hdu_index = 0
+                            if len(hdul) > 1 and hdul[0].data is None:
+                                hdu_index = 1
+                            if hdu_index < len(hdul) and hdul[hdu_index].data is not None:
+                                fits_data = hdul[hdu_index].data
+                                header = hdul[hdu_index].header # Store header
+                                if fits_data.ndim > 2:
+                                    # Simple slice, assuming first axis is non-spatial
+                                    fits_data = fits_data[0, :, :]
+                                img_data_uint8 = _scale_fits_to_uint8(fits_data) # Use helper
+                                if img_data_uint8 is not None:
+                                    if img_data_uint8.ndim == 2:
+                                        img_data = np.stack((img_data_uint8,) * 3, axis=-1)
+                                    elif img_data_uint8.ndim == 3 and img_data_uint8.shape[2] == 3:
+                                        img_data = img_data_uint8
 
                     elif file_lower.endswith((".jpg", ".jpeg", ".png", ".bmp")):
                         img_data_raw = imageio.imread(image_path)
@@ -319,14 +316,14 @@ def saveImages(self):
                     dt_obj = datetime.fromtimestamp(stored_timestamp)
                     print(f"    Set modification time to: {dt_obj.strftime('%Y-%m-%d %H:%M:%S')}")
                 except TypeError:
-                     print(f"    Warning: Invalid timestamp type ({type(stored_timestamp)}) for {img_name}. Cannot set mtime.")
+                     print(f"    Warning: Invalid timestamp type ({type(stored_timestamp)}) for {orig_name}. Cannot set mtime.")
                 except OSError as e: # Catch potential permission errors etc.
                     print(f"    Warning: Could not set modification time for {os.path.basename(save_path)}: {e}")
                 except Exception as e: # Catch other errors like invalid timestamp value
                      print(f"    Warning: Error setting modification time for {os.path.basename(save_path)}: {e}")
                      # traceback.print_exc() # More detail if needed
             else:
-                print(f"    Warning: No original timestamp available for {img_name}. Modification time not set.")
+                print(f"    Warning: No original timestamp available for {orig_name}. Modification time not set.")
             # --- End Set Modification Time ---
 
         except Exception as e:
