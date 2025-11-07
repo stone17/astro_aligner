@@ -4,6 +4,7 @@ import numpy as np
 import imageio
 import traceback # For better error reporting
 import time
+import xisf
 from astropy.io import fits as astro_fits
 from datetime import datetime, timezone # Added timezone for robust timestamp conversion
 from PIL import Image
@@ -33,7 +34,7 @@ def loadFolder(self): # 'self' is the MainWindow instance
         self._current_diff_pixmap = None
 
         print(f"Loading images from: {folder}")
-        supported_load_ext = (".jpg", ".jpeg", ".png", ".bmp", ".fits", ".fit", ".fts")
+        supported_load_ext = (".jpg", ".jpeg", ".png", ".bmp", ".fits", ".fit", ".fts", ".tif", ".tiff", ".xisf")
 
         try:
             all_files_in_dir = os.listdir(folder)
@@ -57,6 +58,8 @@ def loadFolder(self): # 'self' is the MainWindow instance
                 img_data = None # Reset for each file attempt
                 timestamp = None # Reset timestamp for each file
                 header = None # For FITS header
+                tif_data = None
+                xisf_data = None
 
                 # Print progress before try block
                 print(f'File {idx+1:>{len(str(num_files))}}/{num_files}: {file}', end='\r')
@@ -80,6 +83,49 @@ def loadFolder(self): # 'self' is the MainWindow instance
                                         img_data = np.stack((img_data_uint8,) * 3, axis=-1)
                                     elif img_data_uint8.ndim == 3 and img_data_uint8.shape[2] == 3:
                                         img_data = img_data_uint8
+
+                    elif file_lower.endswith((".tif", ".tiff")):
+                        # Use imageio which will use tifffile backend
+                        tif_data = imageio.imread(image_path)
+                        # Handle 16-bit to 8-bit scaling
+                        if tif_data.dtype == np.uint16:
+                            # Scale 16-bit data to 8-bit for display
+                            scaled_data = _scale_fits_to_uint8(tif_data)
+                        else:
+                            # Assume it's already 8-bit or compatible
+                            scaled_data = tif_data.astype(np.uint8)
+
+                        # Ensure image data is 3-channel RGB
+                        if scaled_data.ndim == 2: # Grayscale
+                            img_data = np.stack((scaled_data,) * 3, axis=-1)
+                        elif scaled_data.ndim == 3 and scaled_data.shape[2] == 4: # RGBA
+                            img_data = scaled_data[..., :3]
+                        elif scaled_data.ndim == 3 and scaled_data.shape[2] == 3: # RGB
+                            img_data = scaled_data
+                        else:
+                            print(f"\nUnsupported TIF channel format for {file}")
+
+                    elif file_lower.endswith((".xisf")):
+                        # Use the xisf library
+                        xisf_images = xisf.load(image_path)
+                        if xisf_images:
+                            # Assuming the first image in the file is the one we want
+                            xisf_data = xisf_images[0].data
+                            # Handle 16-bit to 8-bit scaling
+                            if xisf_data.dtype == np.uint16:
+                                scaled_data = _scale_fits_to_uint8(xisf_data)
+                            else:
+                                scaled_data = xisf_data.astype(np.uint8)
+
+                            # Ensure image data is 3-channel RGB
+                            if scaled_data.ndim == 2: # Grayscale
+                                img_data = np.stack((scaled_data,) * 3, axis=-1)
+                            elif scaled_data.ndim == 3: # Assume RGB if 3 channels
+                                img_data = scaled_data
+                            else:
+                                print(f"\nUnsupported XISF data format for {file}")
+                        else:
+                            print(f"\nCould not load image data from XISF file {file}")
 
                     elif file_lower.endswith((".jpg", ".jpeg", ".png", ".bmp")):
                         img_data_raw = imageio.imread(image_path)
@@ -140,13 +186,20 @@ def loadFolder(self): # 'self' is the MainWindow instance
 
                     # --- Append Data to MainWindow's list ---
                     if img_data is not None:
-                        self.image_data.append({
+                        image_entry = {
                             'name': file,
                             'path': image_path,
-                            'image': img_data,
+                            'image': img_data, # This is the 8-bit display image
                             'total_rotation': 0.0,
-                            'timestamp': timestamp # Add the timestamp (can be None)
-                        })
+                            'timestamp': timestamp
+                        }
+                        # Store original 16-bit data if it exists
+                        if 'tif_data' in locals() and tif_data.dtype == np.uint16:
+                            image_entry['image_16bit'] = tif_data
+                        if 'xisf_data' in locals() and xisf_data.dtype == np.uint16:
+                            image_entry['image_16bit'] = xisf_data
+
+                        self.image_data.append(image_entry)
                         load_count += 1
                     else:
                         # Failed loading image data itself
@@ -207,7 +260,7 @@ def loadFolder(self): # 'self' is the MainWindow instance
              self.updatePixmap()
 
 # --- FITS Scaling Helper ---
-def _scale_fits_to_uint8(self, data, p_low=1.0, p_high=99.0):
+def _scale_fits_to_uint8(data, p_low=1.0, p_high=99.0):
     try:
         img = data.astype(np.float32)
         if np.all(np.diff(img.ravel()) == 0): # Check if flat more reliably
@@ -250,18 +303,18 @@ def saveImages(self):
             return
 
         for image in self.image_data:
-            image_list_to_save.append(image['image'])
+            image_list_to_save.append(image)
             image_names_to_save.append(image['name'])
             timestamps.append(image['timestamp'])
     else: # Save current
          if not (0 <= self.current_image_idx < len(self.image_data)):
             QMessageBox.warning(self, "Invalid Selection", "Invalid index.")
             return
-         image_list_to_save.append(self.image_data[self.current_image_idx]['image'])
+         image_list_to_save.append(self.image_data[self.current_image_idx])
          image_names_to_save.append(self.image_data[self.current_image_idx]['name'])
          timestamps.append(self.image_data[self.current_image_idx]['timestamp'])
 
-    save_filter = "PNG Images (*.png);;JPEG Images (*.jpg *.jpeg);;BMP Images (*.bmp)"
+    save_filter = "PNG Images (*.png);;JPEG Images (*.jpg *.jpeg);;BMP Images (*.bmp);;TIFF Images (*.tif *.tiff);;XISF Images (*.xisf)"
     start_dir = self.last_save_folder if self.last_save_folder and os.path.isdir(self.last_save_folder) else os.getcwd()
     save_folder = start_dir
     save_ext = ".png"
@@ -276,6 +329,10 @@ def saveImages(self):
             save_ext = ".jpg"
         elif "BMP" in selectedFilter:
             save_ext = ".bmp"
+        elif "TIFF" in selectedFilter:
+            save_ext = ".tif"
+        elif "XISF" in selectedFilter:
+            save_ext = ".xisf"
         else: save_ext = ".png"
         print(f"Saving all images to folder: {save_folder} as {save_ext}")
     else: # Save current
@@ -285,7 +342,7 @@ def saveImages(self):
         if not fileName: return
         save_folder = os.path.dirname(fileName)
         _, actual_ext = os.path.splitext(fileName)
-        if actual_ext.lower() not in ['.png', '.jpg', '.jpeg', '.bmp']:
+        if actual_ext.lower() not in ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.xisf']:
             QMessageBox.warning(self, "Invalid Extension", f"Unsupported extension '{actual_ext}'. Saving as .png")
             save_ext = ".png"
             fileName = os.path.splitext(fileName)[0] + save_ext
@@ -295,7 +352,7 @@ def saveImages(self):
     self.last_save_folder = save_folder
     self.save_config()
     saved_count, errors = 0, 0
-    for idx, image_data in enumerate(image_list_to_save):
+    for idx, image_dict in enumerate(image_list_to_save):
         try:
             if 'all' in mode:
                 orig_name, _ = os.path.splitext(image_names_to_save[idx])
@@ -303,7 +360,21 @@ def saveImages(self):
                 save_path = os.path.join(save_folder, file_name_only)
             else: save_path = fileName # Full path for single file
             print(f"  Saving: {os.path.basename(save_path)}")
-            imageio.imwrite(save_path, image_data)
+
+            # Determine which image data to save
+            if save_ext.lower() in ['.tif', '.tiff', '.xisf'] and 'image_16bit' in image_dict:
+                image_to_save = image_dict['image_16bit']
+            else:
+                image_to_save = image_dict['image']
+
+            # Handle different file types
+            if save_ext.lower() in ['.xisf']:
+                # For XISF, create an XISF object and save
+                xisf_image = xisf.XISF([image_to_save])
+                xisf_image.save(save_path)
+            else:
+                # For PNG, JPG, BMP, TIF, use imageio
+                imageio.imwrite(save_path, image_to_save)
             saved_count += 1
 
             # --- Set Modification Time ---

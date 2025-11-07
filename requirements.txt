@@ -4,3 +4,6 @@ image-registration
 imageio
 pyyaml
 opencv-python
+tifffile
+xisf
+astropy
