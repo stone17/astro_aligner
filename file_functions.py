@@ -85,47 +85,48 @@ def loadFolder(self): # 'self' is the MainWindow instance
                                         img_data = img_data_uint8
 
                     elif file_lower.endswith((".tif", ".tiff")):
-                        # Use imageio which will use tifffile backend
-                        tif_data = imageio.imread(image_path)
-                        # Handle 16-bit to 8-bit scaling
-                        if tif_data.dtype == np.uint16:
-                            # Scale 16-bit data to 8-bit for display
-                            scaled_data = _scale_fits_to_uint8(tif_data)
-                        else:
-                            # Assume it's already 8-bit or compatible
-                            scaled_data = tif_data.astype(np.uint8)
+                        try:
+                            # Use imageio which will use tifffile backend. It preserves uint16.
+                            img_data_raw = imageio.imread(image_path)
+                            if img_data_raw is None:
+                                print(f"\nWarning: imageio.imread returned None for {file}. Skipping.")
+                                continue # Skip to the next file
 
-                        # Ensure image data is 3-channel RGB
-                        if scaled_data.ndim == 2: # Grayscale
-                            img_data = np.stack((scaled_data,) * 3, axis=-1)
-                        elif scaled_data.ndim == 3 and scaled_data.shape[2] == 4: # RGBA
-                            img_data = scaled_data[..., :3]
-                        elif scaled_data.ndim == 3 and scaled_data.shape[2] == 3: # RGB
-                            img_data = scaled_data
-                        else:
-                            print(f"\nUnsupported TIF channel format for {file}")
+                            # Ensure image data is 3-channel RGB, preserving dtype
+                            if img_data_raw.ndim == 2: # Grayscale
+                                img_data = np.stack((img_data_raw,) * 3, axis=-1)
+                            elif img_data_raw.ndim == 3 and img_data_raw.shape[2] == 4: # RGBA
+                                img_data = img_data_raw[..., :3]
+                            elif img_data_raw.ndim == 3 and img_data_raw.shape[2] == 3: # RGB
+                                img_data = img_data_raw
+                            else:
+                                print(f"\nUnsupported TIF channel format for {file}. Shape: {img_data_raw.shape}")
+                                img_data = None # Set to None to prevent adding to list
+                        except Exception as tif_err:
+                            print(f"\nError processing TIFF file {file}: {tif_err}")
+                            traceback.print_exc() # Print full traceback for debugging
+                            img_data = None
 
                     elif file_lower.endswith((".xisf")):
-                        # Use the xisf library
-                        xisf_images = xisf.load(image_path)
-                        if xisf_images:
-                            # Assuming the first image in the file is the one we want
-                            xisf_data = xisf_images[0].data
-                            # Handle 16-bit to 8-bit scaling
-                            if xisf_data.dtype == np.uint16:
-                                scaled_data = _scale_fits_to_uint8(xisf_data)
+                        try:
+                            xisf_images = xisf.load(image_path)
+                            if xisf_images:
+                                img_data_raw = xisf_images[0].data
+                                # Ensure image data is 3-channel RGB, preserving dtype
+                                if img_data_raw.ndim == 2: # Grayscale
+                                    img_data = np.stack((img_data_raw,) * 3, axis=-1)
+                                elif img_data_raw.ndim == 3: # Assume RGB if 3 channels
+                                    img_data = img_data_raw
+                                else:
+                                    print(f"\nUnsupported XISF data format for {file}")
+                                    img_data = None
                             else:
-                                scaled_data = xisf_data.astype(np.uint8)
-
-                            # Ensure image data is 3-channel RGB
-                            if scaled_data.ndim == 2: # Grayscale
-                                img_data = np.stack((scaled_data,) * 3, axis=-1)
-                            elif scaled_data.ndim == 3: # Assume RGB if 3 channels
-                                img_data = scaled_data
-                            else:
-                                print(f"\nUnsupported XISF data format for {file}")
-                        else:
-                            print(f"\nCould not load image data from XISF file {file}")
+                                print(f"\nCould not load image data from XISF file {file}")
+                                img_data = None
+                        except Exception as xisf_err:
+                            print(f"\nError processing XISF file {file}: {xisf_err}")
+                            traceback.print_exc()
+                            img_data = None
 
                     elif file_lower.endswith((".jpg", ".jpeg", ".png", ".bmp")):
                         img_data_raw = imageio.imread(image_path)
@@ -189,16 +190,10 @@ def loadFolder(self): # 'self' is the MainWindow instance
                         image_entry = {
                             'name': file,
                             'path': image_path,
-                            'image': img_data, # This is the 8-bit display image
+                            'image': img_data, # This now holds data with its original dtype
                             'total_rotation': 0.0,
                             'timestamp': timestamp
                         }
-                        # Store original 16-bit data if it exists
-                        if 'tif_data' in locals() and tif_data.dtype == np.uint16:
-                            image_entry['image_16bit'] = tif_data
-                        if 'xisf_data' in locals() and xisf_data.dtype == np.uint16:
-                            image_entry['image_16bit'] = xisf_data
-
                         self.image_data.append(image_entry)
                         load_count += 1
                     else:
@@ -361,11 +356,8 @@ def saveImages(self):
             else: save_path = fileName # Full path for single file
             print(f"  Saving: {os.path.basename(save_path)}")
 
-            # Determine which image data to save
-            if save_ext.lower() in ['.tif', '.tiff', '.xisf'] and 'image_16bit' in image_dict:
-                image_to_save = image_dict['image_16bit']
-            else:
-                image_to_save = image_dict['image']
+            # The 'image' key now holds the fully transformed image with the correct dtype
+            image_to_save = image_dict['image']
 
             # Handle different file types
             if save_ext.lower() in ['.xisf']:
