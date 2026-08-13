@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import imageio
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from image_registration import chi2_shift
 from astropy.io import fits as astro_fits
 import os
@@ -271,72 +272,50 @@ def _register_fft(ref_grey, current_grey):
         return None, None
 
 
-# MODIFIED: Added step_size parameter
-def _register_scan_ssd(ref_anchor, current_grey, anchor_details, step_size=1):
-    """Registers one image using Scan SSD. Returns (best_dx, best_dy).
-       Takes step_size explicitly.
+def _register_scan_ssd(ref_anchor, current_grey, anchor_details, scan_range=100):
+    """Registers one image using Scan SSD / Normalized Cross-Correlation via multi-threaded C++ template matching.
+    Returns (best_dx, best_dy, max_val) or (None, None, None).
+    `best_dx` and `best_dy` are integer displacements of current_grey relative to ref_anchor.
+    `max_val` is the normalized cross-correlation coefficient in range [-1.0, 1.0].
     """
-    # print(f"  Using Scan SSD (Step: {step_size})...") # Worker logs this
-    scan_range_pixels = 15 # Define scan range
+    if ref_anchor is None or current_grey is None or not anchor_details:
+        return None, None, None
 
-    # Extract anchor details
     anc_x = anchor_details['x']
     anc_y = anchor_details['y']
     anc_w = anchor_details['w']
     anc_h = anchor_details['h']
 
-    img_h, img_w = current_grey.shape # Dimensions of current image
+    img_h, img_w = current_grey.shape
 
-    min_ssd = np.inf
-    best_dx = 0
-    best_dy = 0
+    y_min = max(0, anc_y - scan_range)
+    y_max = min(img_h, anc_y + anc_h + scan_range)
+    x_min = max(0, anc_x - scan_range)
+    x_max = min(img_w, anc_x + anc_w + scan_range)
 
-    # Ensure step_size is at least 1
-    step_size = max(1, int(step_size))
+    search_region = current_grey[y_min:y_max, x_min:x_max]
+    if search_region.shape[0] < ref_anchor.shape[0] or search_region.shape[1] < ref_anchor.shape[1]:
+        return None, None, None
 
-    # Scan loop
-    for dy in range(-scan_range_pixels, scan_range_pixels + 1, step_size):
-        for dx in range(-scan_range_pixels, scan_range_pixels + 1, step_size):
-            # Current anchor coordinates in the potentially shifted image
-            curr_y_start = anc_y + dy
-            curr_y_end = curr_y_start + anc_h
-            curr_x_start = anc_x + dx
-            curr_x_end = curr_x_start + anc_w
+    try:
+        res = cv2.matchTemplate(search_region.astype(np.float32), ref_anchor.astype(np.float32), cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, (mx, my) = cv2.minMaxLoc(res)
 
-            # Boundary check
-            if (0 <= curr_y_start and curr_y_end <= img_h and
-                0 <= curr_x_start and curr_x_end <= img_w):
-
-                current_shifted_anchor = current_grey[curr_y_start:curr_y_end, curr_x_start:curr_x_end]
-
-                # Calculate SSD (ensure shapes match - paranoia check)
-                if current_shifted_anchor.shape == ref_anchor.shape:
-                    # Use float32 for potentially better precision in SSD calculation
-                    diff = current_shifted_anchor.astype(np.float32) - ref_anchor.astype(np.float32)
-                    ssd = np.sum(diff**2)
-                    # Update minimum
-                    if ssd < min_ssd:
-                        min_ssd = ssd
-                        best_dx = dx
-                        best_dy = dy
-                # else: # Debugging shape mismatches
-                #    print(f"Shape mismatch in SSD Scan: Current={current_shifted_anchor.shape}, Ref={ref_anchor.shape} at dx={dx}, dy={dy}")
-
-
-    # print(f"  Scan Best Shift Found (dX:{best_dx}, dY:{best_dy}), Min SSD: {min_ssd:.4g}") # Worker logs this
-    if min_ssd == np.inf: # Check if no valid position was found
-        print("  Scan SSD Warning: No valid anchor positions found within scan range.")
-        return None, None
-    return best_dx, best_dy # Return the shift dx, dy found
+        best_dx = (x_min + mx) - anc_x
+        best_dy = (y_min + my) - anc_y
+        return best_dx, best_dy, float(max_val)
+    except Exception as e:
+        print(f"Scan SSD error: {e}")
+        return None, None, None
 
 
 def _register_scan_ssd_rot(ref_anchor, current_grey, anchor_details):
-    """Registers one image rotation using Scan SSD around an anchor. Returns best_angle."""
-    # print(f"  Using Scan SSD Rot...") # Worker logs this
-    step_size = 0.2
-    scan_range_degrees = 5.0 # Define scan range
+    """Registers one image rotation using parallel SSD comparison across angles. Returns best_angle."""
+    if ref_anchor is None or current_grey is None or not anchor_details:
+        return None
 
-    # Extract anchor details (needed for slicing the rotated image)
+    step_size = 0.2
+    scan_range_degrees = 5.0
     anc_x = anchor_details['x']
     anc_y = anchor_details['y']
     anc_w = anchor_details['w']
@@ -347,43 +326,90 @@ def _register_scan_ssd_rot(ref_anchor, current_grey, anchor_details):
     x_start = anc_x
     x_end = x_start + anc_w
 
-    img_h, img_w = current_grey.shape # Dimensions of current image
-
-    min_ssd = np.inf
-    best_angle = 0.0
-
-    # Ensure reference anchor is float32 for SSD comparison
     ref_anchor_float = ref_anchor.astype(np.float32)
+    angles = np.arange(-scan_range_degrees, scan_range_degrees + step_size, step_size)
 
-    # Scan loop over angles
-    for angle in np.arange(-scan_range_degrees, scan_range_degrees + step_size, step_size):
-        # Rotate the *entire* current grayscale image
+    def _eval_angle(angle):
         rotated_grey = _perform_cv_rotation(current_grey, angle)
-        if rotated_grey is None: continue # Skip if rotation failed
-
-        # Extract the anchor region from the *rotated* image
-        # Check bounds after rotation (though rotation preserves size, belt-and-braces)
+        if rotated_grey is None:
+            return np.inf, angle
         if (0 <= y_start < y_end <= rotated_grey.shape[0] and
             0 <= x_start < x_end <= rotated_grey.shape[1]):
-
             current_rotated_anchor = rotated_grey[y_start:y_end, x_start:x_end]
-
-            # Calculate SSD (ensure shapes match)
             if current_rotated_anchor.shape == ref_anchor_float.shape:
                 diff = current_rotated_anchor.astype(np.float32) - ref_anchor_float
                 ssd = np.sum(diff**2)
-                # Update minimum
-                if ssd < min_ssd:
-                    min_ssd = ssd
-                    best_angle = angle
-            # else: # Debugging shape mismatches
-            #    print(f"Shape mismatch in SSD Rot Scan: Rotated={current_rotated_anchor.shape}, Ref={ref_anchor_float.shape} at angle={angle}")
-        # else: # Debugging bounds issues
-        #    print(f"Anchor bounds invalid after rotation for angle {angle}")
+                return float(ssd), angle
+        return np.inf, angle
 
+    max_workers = min(32, (os.cpu_count() or 4) + 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(_eval_angle, angles))
 
-    # print(f"  Scan Rot Best Angle Found (angle:{best_angle:.2f}), Min SSD: {min_ssd:.4g}") # Worker logs this
-    if min_ssd == np.inf: # Check if no valid rotation was found
+    min_ssd, best_angle = min(results, key=lambda item: item[0])
+    if min_ssd == np.inf:
         print("  Scan SSD Rot Warning: No valid anchor positions found within scan range.")
         return None
-    return best_angle # Return the best angle delta found
+    return best_angle
+
+
+def match_brightness(target_img, ref_img, anchor_details=None):
+    """
+    Adjusts the brightness of target_img to match ref_img.
+    If anchor_details is provided, calculates scaling ratio within the anchor region.
+    Supports both 3D color images (H, W, 3) and 2D grayscale images (H, W).
+    """
+    if target_img is None or ref_img is None:
+        return target_img
+
+    target_patch = target_img
+    ref_patch = ref_img
+
+    if anchor_details:
+        anc_x = anchor_details.get('x', 0)
+        anc_y = anchor_details.get('y', 0)
+        anc_w = anchor_details.get('w', 0)
+        anc_h = anchor_details.get('h', 0)
+        if (0 <= anc_y < anc_y + anc_h <= ref_img.shape[0] and
+            0 <= anc_x < anc_x + anc_w <= ref_img.shape[1] and
+            0 <= anc_y < anc_y + anc_h <= target_img.shape[0] and
+            0 <= anc_x < anc_x + anc_w <= target_img.shape[1]):
+            ref_patch = ref_img[anc_y:anc_y+anc_h, anc_x:anc_x+anc_w]
+            target_patch = target_img[anc_y:anc_y+anc_h, anc_x:anc_x+anc_w]
+
+    synced_img = target_img.astype(np.float32)
+
+    if target_img.ndim == 3 and target_img.shape[2] == 3:
+        for c in range(3):
+            ref_c = ref_patch[..., c]
+            target_c = target_patch[..., c]
+
+            ref_mask = ref_c > 5
+            target_mask = target_c > 5
+
+            ref_mean = np.mean(ref_c[ref_mask]) if np.any(ref_mask) else np.mean(ref_c)
+            target_mean = np.mean(target_c[target_mask]) if np.any(target_mask) else np.mean(target_c)
+
+            if target_mean > 1e-4:
+                gain = ref_mean / target_mean
+                gain = np.clip(gain, 0.2, 5.0)
+            else:
+                gain = 1.0
+
+            synced_img[..., c] *= gain
+    else:
+        ref_mask = ref_patch > 5
+        target_mask = target_patch > 5
+
+        ref_mean = np.mean(ref_patch[ref_mask]) if np.any(ref_mask) else np.mean(ref_patch)
+        target_mean = np.mean(target_patch[target_mask]) if np.any(target_mask) else np.mean(target_patch)
+
+        if target_mean > 1e-4:
+            gain = ref_mean / target_mean
+            gain = np.clip(gain, 0.2, 5.0)
+        else:
+            gain = 1.0
+
+        synced_img *= gain
+
+    return np.clip(synced_img, 0, 255).astype(np.uint8)

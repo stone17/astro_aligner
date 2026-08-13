@@ -1,7 +1,7 @@
 import os
 import sys
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QRadioButton, QLabel, QLineEdit, QFrame, QPushButton,
+    QApplication, QMainWindow, QRadioButton, QCheckBox, QLabel, QLineEdit, QFrame, QPushButton,
     QGridLayout, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QButtonGroup, QMessageBox,
     QScrollArea, QProgressDialog, QFileDialog
     )
@@ -302,9 +302,9 @@ class MainWindow(QMainWindow):
         reg_settings_layout.setContentsMargins(5, 5, 5, 5)
         reg_title = QLabel("Image Registration:")
         reg_title.setStyleSheet("font-weight: bold;")
-        reg_settings_layout.addWidget(reg_title, 0, 0, 1, 2)
+        reg_settings_layout.addWidget(reg_title, 0, 0, 1, 3)
         self.reg_method_fft_radio = QRadioButton("FFT (Fast, Subpixel)")
-        self.reg_method_fft_radio.setToolTip("Uses image_registration.chi2_shift.\nAnchor area is ignored.")
+        self.reg_method_fft_radio.setToolTip("Uses image_registration.chi2_shift.\nAnchor area is ignored if not defined.")
         self.reg_method_scan_radio = QRadioButton("Scan Shift")
         self.reg_method_scan_radio.setToolTip("Scans around anchor for minimum difference.\nRequires anchor. Integer shifts only.")
         self.reg_method_scan_rot_radio = QRadioButton("Scan Rot")
@@ -313,22 +313,33 @@ class MainWindow(QMainWindow):
         self.reg_method_group.addButton(self.reg_method_fft_radio)
         self.reg_method_group.addButton(self.reg_method_scan_radio)
         self.reg_method_group.addButton(self.reg_method_scan_rot_radio)
-        reg_settings_layout.addWidget(self.reg_method_fft_radio, 1, 0, 1, 2)
+        reg_settings_layout.addWidget(self.reg_method_fft_radio, 1, 0, 1, 3)
         reg_settings_layout.addWidget(self.reg_method_scan_radio, 2, 0, 1, 1)
-        reg_settings_layout.addWidget(self.reg_method_scan_rot_radio, 2, 1, 1, 1)
+        reg_settings_layout.addWidget(self.reg_method_scan_rot_radio, 2, 1, 1, 2)
         self.reg_method_fft_radio.setChecked(True) # Default to FFT
 
-        # --- MODIFIED: Connect buttons to start_registration ---
-        self.btn_register_all = QPushButton('Register all', self)
-        self.btn_register_all.setToolTip("Register all to reference.")
-        self.btn_register_all.clicked.connect(partial(self.start_registration, 'all')) # Use partial for mode
-        reg_settings_layout.addWidget(self.btn_register_all, 3, 1)
+        self.cb_rolling_mode = QCheckBox("Rolling Master Frame", self)
+        self.cb_rolling_mode.setToolTip("When enabled, aligns images sequentially against the previous aligned image instead of a fixed reference.")
+        reg_settings_layout.addWidget(self.cb_rolling_mode, 3, 0, 1, 2)
+
+        self.cb_sync_brightness = QCheckBox("Sync Brightness", self)
+        self.cb_sync_brightness.setToolTip("When enabled, adjusts image brightness/exposure to match the reference image.")
+        reg_settings_layout.addWidget(self.cb_sync_brightness, 3, 2, 1, 1)
 
         self.btn_register_current = QPushButton('Register current', self)
-        self.btn_register_current.setToolTip("Register current to reference.")
-        self.btn_register_current.clicked.connect(partial(self.start_registration, 'current')) # Use partial for mode
-        reg_settings_layout.addWidget(self.btn_register_current, 3, 0)
-        # --- END MODIFICATION ---
+        self.btn_register_current.setToolTip("Register current image to reference (or previous image in rolling mode).")
+        self.btn_register_current.clicked.connect(partial(self.start_registration, 'current'))
+        reg_settings_layout.addWidget(self.btn_register_current, 4, 0)
+
+        self.btn_register_from_current = QPushButton('Register from current', self)
+        self.btn_register_from_current.setToolTip("Register all images from current onwards sequentially (ignores images before current).")
+        self.btn_register_from_current.clicked.connect(partial(self.start_registration, 'from_current'))
+        reg_settings_layout.addWidget(self.btn_register_from_current, 4, 1)
+
+        self.btn_register_all = QPushButton('Register all', self)
+        self.btn_register_all.setToolTip("Register all images.")
+        self.btn_register_all.clicked.connect(partial(self.start_registration, 'all'))
+        reg_settings_layout.addWidget(self.btn_register_all, 4, 2)
 
         control_layout.addWidget(reg_settings_frame, 0, 0)
 
@@ -1399,7 +1410,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Busy", "Another process is already running.")
             return
 
-        # --- Initial Checks (similar to original function) ---
+        # --- Initial Checks ---
         if not hasattr(self, 'image_data') or len(self.image_data) < 2:
             QMessageBox.warning(self, "Not Ready", "Need at least two images loaded.")
             return
@@ -1414,70 +1425,84 @@ class MainWindow(QMainWindow):
         use_scan_rot_method = self.reg_method_scan_rot_radio.isChecked()
         reg_method_str = 'fft' if use_fft_method else ('scan' if use_scan_method else 'scan_rot')
 
-        print(f"Starting registration thread using {reg_method_str} method.")
+        is_rolling = self.cb_rolling_mode.isChecked()
+        print(f"Starting registration thread using {reg_method_str} method (rolling={is_rolling}).")
 
-        # --- Determine Indices ---
-        indices_to_register = []
+        # --- Determine Registration Pairs (target_idx, ref_idx) ---
+        registration_pairs = []
+
         if mode == 'all':
-            indices_to_register = [i for i in range(num_images) if i != self.ref_image_idx]
-            if not indices_to_register:
-                QMessageBox.information(self, "Register All", "No other images to register to the reference.")
+            if is_rolling:
+                # Forward from reference to end
+                for i in range(self.ref_image_idx + 1, num_images):
+                    registration_pairs.append((i, i - 1))
+                # Backward from reference to start
+                for i in range(self.ref_image_idx - 1, -1, -1):
+                    registration_pairs.append((i, i + 1))
+            else:
+                registration_pairs = [(i, self.ref_image_idx) for i in range(num_images) if i != self.ref_image_idx]
+
+            if not registration_pairs:
+                QMessageBox.information(self, "Register All", "No other images to register.")
                 return
-            print(f"Processing all ({len(indices_to_register)}) images...")
-        elif mode == 'current':
-            if self.current_image_idx == self.ref_image_idx:
-                QMessageBox.information(self, "Register Current", "Current image is the reference image. Cannot register.")
-                return
+            print(f"Processing all ({len(registration_pairs)}) pairs...")
+
+        elif mode == 'from_current':
             if not (0 <= self.current_image_idx < num_images):
                 QMessageBox.warning(self, "Invalid Selection", "Invalid current image index selected.")
                 return
-            indices_to_register = [self.current_image_idx]
-            print(f"Processing current image (index {self.current_image_idx})...")
+            if self.current_image_idx >= num_images - 1:
+                QMessageBox.information(self, "Register From Current", "Current image is the last image. No subsequent images to register.")
+                return
+
+            if is_rolling:
+                for i in range(self.current_image_idx + 1, num_images):
+                    registration_pairs.append((i, i - 1))
+            else:
+                for i in range(self.current_image_idx + 1, num_images):
+                    if i != self.ref_image_idx:
+                        registration_pairs.append((i, self.ref_image_idx))
+
+            if not registration_pairs:
+                QMessageBox.information(self, "Register From Current", "No subsequent images to register.")
+                return
+            print(f"Processing from current ({len(registration_pairs)}) pairs...")
+
+        elif mode == 'current':
+            if not (0 <= self.current_image_idx < num_images):
+                QMessageBox.warning(self, "Invalid Selection", "Invalid current image index selected.")
+                return
+
+            if is_rolling:
+                if self.current_image_idx == 0:
+                    QMessageBox.warning(self, "Register Current", "First image has no previous image for rolling registration.")
+                    return
+                registration_pairs = [(self.current_image_idx, self.current_image_idx - 1)]
+            else:
+                if self.current_image_idx == self.ref_image_idx:
+                    QMessageBox.information(self, "Register Current", "Current image is the reference image. Cannot register.")
+                    return
+                registration_pairs = [(self.current_image_idx, self.ref_image_idx)]
+
+            print(f"Processing current image pair (target={registration_pairs[0][0]}, ref={registration_pairs[0][1]})...")
+
         else:
             QMessageBox.warning(self, "Error", f"Unknown registration mode '{mode}'.")
             return
 
-        if not indices_to_register:
-            QMessageBox.information(self, "Register", f"No images selected for registration ('{mode}' mode).")
-            return
-
-        # --- Prepare Reference Image Data ---
-        try:
-            ref_image_full_color = self.image_data[self.ref_image_idx]['image']
-            # Convert to grayscale float32 once
-            ref_grey = np.dot(ref_image_full_color[..., :3].astype(np.float32), [0.2989, 0.5870, 0.1140])
-        except Exception as e:
-            QMessageBox.critical(self, "Registration Error", f"Error preparing reference image:\n{e}")
-            traceback.print_exc()
-            return
-
-        # --- Prepare Reference Anchor (if needed) ---
-        ref_anchor = None
-        anchor_details = {} # Store x,y,w,h if scan method used
+        # --- Prepare Reference Anchor Details (if needed) ---
+        anchor_details = {}
         if self.anchor_rect_img_coords:
-            try:
-                rect = self.anchor_rect_img_coords
-                anc_x = rect.left()
-                anc_y = rect.top()
-                anc_w = rect.width()
-                anc_h = rect.height()
-                anchor_details = {'x': anc_x, 'y': anc_y, 'w': anc_w, 'h': anc_h} # Pass details
-                # Check anchor validity against reference image
-                if not (0 <= anc_y < anc_y + anc_h <= ref_grey.shape[0] and
-                        0 <= anc_x < anc_x + anc_w <= ref_grey.shape[1]):
-                    QMessageBox.critical(self, "Registration Error", f"Anchor rectangle is invalid for reference image dimensions {ref_grey.shape}.")
-                    return
-                # Extract the anchor patch (as float32 for consistency)
-                ref_anchor = ref_grey[anc_y : anc_y + anc_h, anc_x : anc_x + anc_w].astype(np.float32)
-            except Exception as e:
-                 QMessageBox.critical(self, "Registration Error", f"Error preparing reference anchor:\n{e}")
-                 traceback.print_exc()
-                 return
+            rect = self.anchor_rect_img_coords
+            anc_x = rect.left()
+            anc_y = rect.top()
+            anc_w = rect.width()
+            anc_h = rect.height()
+            anchor_details = {'x': anc_x, 'y': anc_y, 'w': anc_w, 'h': anc_h}
         else:
-            # Check if anchor is required but missing
             if use_scan_method or use_scan_rot_method:
                 QMessageBox.warning(self, "Anchor Required", f"{reg_method_str.upper()} method requires an anchor area to be defined (draw or input values and click Apply).")
-                return # Stop registration
+                return
 
         # --- Get Shift Value (for Scan SSD step) ---
         try:
@@ -1487,21 +1512,19 @@ class MainWindow(QMainWindow):
             shift_val_step = 1
 
         # --- Create Worker and Thread ---
-        # Pass copies of data where necessary, although worker primarily reads
-        # Pass the list of dicts - worker will access 'image', 'image_orig', 'total_rotation'
-        # Make a deep copy of the list structure and potentially numpy arrays if modification is feared
-        # For now, assume worker reads and emits updates, main thread applies updates.
-        worker_image_data = copy.deepcopy(self.image_data) # Deep copy to isolate worker data
+        worker_image_data = copy.deepcopy(self.image_data)
 
         self.worker = RegistrationWorker(
-            image_data_list=worker_image_data, # Pass the deep copy
+            image_data_list=worker_image_data,
             ref_image_idx=self.ref_image_idx,
-            indices_to_register=indices_to_register,
+            indices_to_register=[target for target, _ in registration_pairs],
             reg_method=reg_method_str,
-            anchor_details=anchor_details, # Pass dict
-            ref_grey=ref_grey.copy(), # Pass copy
-            ref_anchor=ref_anchor.copy() if ref_anchor is not None else None, # Pass copy
-            shift_val=shift_val_step
+            anchor_details=anchor_details if anchor_details else None,
+            ref_grey=None,
+            ref_anchor=None,
+            shift_val=shift_val_step,
+            registration_pairs=registration_pairs,
+            sync_brightness=self.cb_sync_brightness.isChecked()
         )
         self.worker_thread = QThread()
         self.worker.moveToThread(self.worker_thread)
@@ -1522,7 +1545,7 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self._on_worker_thread_finished) # General cleanup slot
 
         # --- Setup Progress Dialog ---
-        num_to_process = len(indices_to_register)
+        num_to_process = len(registration_pairs)
         self._setup_progress_dialog("Registering Images", "Registering...", num_to_process)
         self.progress_dialog.canceled.connect(self.cancel_worker) # Connect cancel button
         self.progress_dialog.show()
@@ -1684,23 +1707,23 @@ class MainWindow(QMainWindow):
         self._update_rotation_textbox()
 
 
-    @pyqtSlot(int, np.ndarray)
-    def handle_image_update(self, index, modified_image_array):
+    @pyqtSlot(int, int, np.ndarray)
+    def handle_image_update(self, index, ref_index, modified_image_array):
         """Updates the image data in the main list when worker sends update.
-           Switches the 'Current Image' view to show this newly processed image.
+           Switches the 'Current Image' view to show this newly processed image,
+           and updates the 'Reference Image' view if ref_index changed.
         """
         if 0 <= index < len(self.image_data):
             # Always update the underlying data store
             self.image_data[index]['image'] = modified_image_array
-            print(f"Received image update for index {index}. Switching view.")
+            print(f"Received image update for index {index} (ref={ref_index}). Switching view.")
 
             # --- Switch the Current Image View ---
             # 1. Update the internal current index
             self.current_image_idx = index
 
             # 2. Update the selection highlight in the QListWidget
-            # Block signals temporarily to prevent item_changed from firing and potentially
-            # clearing points or causing other side effects of manual selection change.
+            # Block signals temporarily to prevent item_changed from firing
             self.image_list.blockSignals(True)
             self.image_list.setCurrentRow(index)
             self.image_list.blockSignals(False)
@@ -1708,18 +1731,30 @@ class MainWindow(QMainWindow):
             # 3. Regenerate the base pixmap for the *new* current image
             self._current_base_pixmap = self._create_base_pixmap(modified_image_array)
 
-            # 4. Update the difference pixmap if needed (uses the new current image)
-            # Note: This requires the reference pixmap (_ref_base_pixmap) to be up-to-date.
-            # If the reference image itself could be processed (unlikely but possible),
-            # we might need to ensure _ref_base_pixmap is also updated. Assuming ref is fixed during run.
+            # 4. Switch Reference Image view & checkmark if ref_index changed
+            if 0 <= ref_index < len(self.image_data) and ref_index != self.ref_image_idx:
+                self.ref_image_idx = ref_index
+                ref_item = self.image_list.item(ref_index)
+                if ref_item:
+                    self.image_list.blockSignals(True)
+                    ref_item.setCheckState(Qt.Checked)
+                    for i in range(self.image_list.count()):
+                        item_i = self.image_list.item(i)
+                        if item_i != ref_item and item_i.checkState() == Qt.Checked:
+                            item_i.setCheckState(Qt.Unchecked)
+                    self.image_list.blockSignals(False)
+
+                ref_image_data = self.image_data[ref_index]['image']
+                self._ref_base_pixmap = self._create_base_pixmap(ref_image_data)
+
+            # 5. Update the difference pixmap if needed (uses the new current & ref image)
             if self.radio_buttons['rad_diff'].isChecked():
                 self._update_diff_pixmap()
 
-            # 5. Redraw the pixmaps with overlays and zoom.
-            # update_base=False prevents regenerating base pixmaps again.
+            # 6. Redraw the pixmaps with overlays and zoom.
             self.updatePixmap(update_base=False)
 
-            # 6. Update the rotation text box to match the new current image
+            # 7. Update the rotation text box to match the new current image
             self._update_rotation_textbox()
             # --- End View Switch ---
 

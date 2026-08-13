@@ -5,13 +5,20 @@ import imageio
 import os
 import time # For potential delays if needed
 
+from concurrent.futures import ThreadPoolExecutor
+
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot
 from image_registration import chi2_shift
 import cv2 # Make sure cv2 is imported if used directly here
 
-# Import necessary functions from image_functions (adjust path if needed)
-# We might need to move some helper functions here or pass them if they don't rely on 'self'
-from image_functions import _perform_cv_rotation, _register_fft, _register_scan_ssd_rot
+# Import necessary functions from image_functions
+from image_functions import (
+    _perform_cv_rotation,
+    _register_fft,
+    _register_scan_ssd,
+    _register_scan_ssd_rot,
+    match_brightness
+)
 
 # --- Registration Worker ---
 
@@ -28,25 +35,46 @@ class RegistrationWorker(QObject):
     error = pyqtSignal(str)
     # log_message(message)
     log_message = pyqtSignal(str)
-    # image_updated(index, modified_image_array) - Sends back processed image data
-    image_updated = pyqtSignal(int, np.ndarray)
+    # image_updated(index, ref_index, modified_image_array) - Sends back processed image data
+    image_updated = pyqtSignal(int, int, np.ndarray)
     # rotation_updated(index, new_total_rotation) - Sends back updated rotation
     rotation_updated = pyqtSignal(int, float)
 
 
     def __init__(self, image_data_list, ref_image_idx, indices_to_register,
-                 reg_method, anchor_details, ref_grey, ref_anchor, shift_val):
+                 reg_method, anchor_details, ref_grey=None, ref_anchor=None, shift_val=1,
+                 registration_pairs=None, sync_brightness=False):
         super().__init__()
-        # Store necessary data (consider making deep copies if mutable objects are modified)
-        # For simplicity now, we assume the main thread won't modify these during processing
+        # Store necessary data
         self.image_data_list = image_data_list # List of dicts
         self.ref_image_idx = ref_image_idx
         self.indices_to_register = indices_to_register
         self.reg_method = reg_method # e.g., 'fft', 'scan', 'scan_rot'
         self.anchor_details = anchor_details # dict or None
-        self.ref_grey = ref_grey # np.ndarray
+        self.ref_grey = ref_grey # np.ndarray or None
         self.ref_anchor = ref_anchor # np.ndarray or None
         self.shift_val = shift_val # int (for scan step)
+        self.sync_brightness = sync_brightness
+
+        # Ensure initial master reference gray and anchor are computed if missing
+        if (self.ref_grey is None or self.ref_anchor is None) and 0 <= ref_image_idx < len(image_data_list):
+            initial_ref_img = image_data_list[ref_image_idx]['image']
+            if not initial_ref_img.flags['C_CONTIGUOUS']:
+                initial_ref_img = np.ascontiguousarray(initial_ref_img)
+            self.ref_grey = np.dot(initial_ref_img[..., :3].astype(np.float32), [0.2989, 0.5870, 0.1140])
+            if self.anchor_details:
+                anc_x = self.anchor_details['x']
+                anc_y = self.anchor_details['y']
+                anc_w = self.anchor_details['w']
+                anc_h = self.anchor_details['h']
+                if (0 <= anc_y < anc_y + anc_h <= self.ref_grey.shape[0] and
+                    0 <= anc_x < anc_x + anc_w <= self.ref_grey.shape[1]):
+                    self.ref_anchor = self.ref_grey[anc_y : anc_y + anc_h, anc_x : anc_x + anc_w].astype(np.float32)
+
+        if registration_pairs is not None:
+            self.registration_pairs = registration_pairs
+        else:
+            self.registration_pairs = [(idx, ref_image_idx) for idx in indices_to_register]
 
         self._is_cancelled = False
 
@@ -56,167 +84,267 @@ class RegistrationWorker(QObject):
         self.log_message.emit("Cancellation requested...")
         self._is_cancelled = True
 
+    def _process_single_pair(self, idx, current_ref_idx):
+        """Processes registration for a single target/reference pair."""
+        logs = []
+        target_info = self.image_data_list[idx]
+        target_name = target_info['name']
+        ref_info = self.image_data_list[current_ref_idx]
+        ref_name = ref_info['name']
+
+        total_images_in_list = len(self.image_data_list)
+        logs.append(
+            f"--- Processing Image {idx + 1}/{total_images_in_list} ('{target_name}') "
+            f"against Ref Image {current_ref_idx + 1} ('{ref_name}') ---"
+        )
+
+        try:
+            ref_image_full_color = ref_info['image']
+            if not ref_image_full_color.flags['C_CONTIGUOUS']:
+                ref_image_full_color = np.ascontiguousarray(ref_image_full_color)
+
+            ref_grey = np.dot(ref_image_full_color[..., :3].astype(np.float32), [0.2989, 0.5870, 0.1140])
+
+            rolling_ref_anchor = None
+            if self.anchor_details:
+                anc_x = self.anchor_details['x']
+                anc_y = self.anchor_details['y']
+                anc_w = self.anchor_details['w']
+                anc_h = self.anchor_details['h']
+                if (0 <= anc_y < anc_y + anc_h <= ref_grey.shape[0] and
+                    0 <= anc_x < anc_x + anc_w <= ref_grey.shape[1]):
+                    rolling_ref_anchor = ref_grey[anc_y : anc_y + anc_h, anc_x : anc_x + anc_w].astype(np.float32)
+
+            current_image_full_color = target_info['image']
+            if not current_image_full_color.flags['C_CONTIGUOUS']:
+                current_image_full_color = np.ascontiguousarray(current_image_full_color)
+
+            current_grey = np.dot(current_image_full_color[..., :3].astype(np.float32), [0.2989, 0.5870, 0.1140])
+
+            shift_x_int, shift_y_int = 0, 0
+            rot_angle = 0.0
+            corrected_image = None
+            new_total_rotation = None
+
+            if self.reg_method == 'fft':
+                xoff, yoff = None, None
+                if self.anchor_details:
+                    anc_x = self.anchor_details['x']
+                    anc_y = self.anchor_details['y']
+                    anc_w = self.anchor_details['w']
+                    anc_h = self.anchor_details['h']
+                    pad = 50
+
+                    y0 = max(0, anc_y - pad)
+                    y1 = min(current_grey.shape[0], anc_y + anc_h + pad)
+                    x0 = max(0, anc_x - pad)
+                    x1 = min(current_grey.shape[1], anc_x + anc_w + pad)
+
+                    current_crop = current_grey[y0:y1, x0:x1]
+                    ref_crop = ref_grey[y0:y1, x0:x1]
+
+                    if ref_crop.shape == current_crop.shape and ref_crop.size > 0:
+                        xoff_crop, yoff_crop = _register_fft(ref_crop, current_crop)
+                        if xoff_crop is not None and yoff_crop is not None:
+                            xoff, yoff = xoff_crop, yoff_crop
+                            logs.append("  FFT matched Anchor region.")
+
+                if xoff is None:
+                    xoff_full, yoff_full = _register_fft(ref_grey, current_grey)
+                    if xoff_full is not None and yoff_full is not None:
+                        xoff, yoff = xoff_full, yoff_full
+                        logs.append("  FFT matched Full Image.")
+
+                if xoff is not None and yoff is not None:
+                    shift_y_int = -int(round(yoff))
+                    shift_x_int = -int(round(xoff))
+                else:
+                    logs.append(f"  FFT failed for image {idx}.")
+                    return idx, current_ref_idx, None, None, False, logs
+
+            elif self.reg_method == 'scan':
+                if rolling_ref_anchor is None and self.ref_anchor is None:
+                    logs.append(f"  Scan SSD requires an anchor. Skipping image {idx}.")
+                    return idx, current_ref_idx, None, None, False, logs
+
+                xoff, yoff = None, None
+                scan_range = max(int(self.shift_val) if self.shift_val else 100, 100)
+
+                # 1. Try Rolling Reference Anchor first (for sequential stability)
+                if rolling_ref_anchor is not None:
+                    xoff_roll, yoff_roll, score_roll = _register_scan_ssd(
+                        rolling_ref_anchor, current_grey, self.anchor_details, scan_range=scan_range
+                    )
+                    if xoff_roll is not None and score_roll is not None and score_roll >= 0.20:
+                        xoff, yoff = xoff_roll, yoff_roll
+                        logs.append(f"  Scan SSD matched Rolling Anchor (correlation: {score_roll:.4f})")
+
+                # 2. Try Initial Master Anchor as fallback if rolling anchor failed (e.g. clouds)
+                if xoff is None and self.ref_anchor is not None:
+                    xoff_init, yoff_init, score_init = _register_scan_ssd(
+                        self.ref_anchor, current_grey, self.anchor_details, scan_range=scan_range
+                    )
+                    if xoff_init is not None and score_init is not None and score_init >= 0.40:
+                        xoff, yoff = xoff_init, yoff_init
+                        logs.append(f"  Scan SSD matched Initial Master Anchor (correlation: {score_init:.4f})")
+
+                if xoff is not None and yoff is not None:
+                    shift_x_int = -int(round(xoff))
+                    shift_y_int = -int(round(yoff))
+                else:
+                    logs.append(f"  Scan SSD failed for image {idx}.")
+                    return idx, current_ref_idx, None, None, False, logs
+
+            elif self.reg_method == 'scan_rot':
+                if rolling_ref_anchor is None and self.ref_anchor is None:
+                    logs.append(f"  Scan Rot requires an anchor. Skipping image {idx}.")
+                    return idx, current_ref_idx, None, None, False, logs
+
+                rot_delta = None
+                if self.ref_anchor is not None:
+                    rot_delta = _register_scan_ssd_rot(self.ref_anchor, current_grey, self.anchor_details)
+                    if rot_delta is not None:
+                        logs.append("  Scan Rot matched Initial Master Anchor.")
+
+                if rot_delta is None and rolling_ref_anchor is not None:
+                    rot_delta = _register_scan_ssd_rot(rolling_ref_anchor, current_grey, self.anchor_details)
+                    if rot_delta is not None:
+                        logs.append("  Scan Rot matched Rolling Anchor.")
+
+                if rot_delta is not None:
+                    rot_angle = rot_delta
+                else:
+                    logs.append(f"  Scan Rot failed for image {idx}.")
+                    return idx, current_ref_idx, None, None, False, logs
+            else:
+                logs.append(f"  Unknown registration method: {self.reg_method}")
+                return idx, current_ref_idx, None, None, False, logs
+
+            image_changed = False
+            if abs(shift_y_int) > 0 or abs(shift_x_int) > 0:
+                logs.append(f"  Applying final shift (dX:{shift_x_int}, dY:{shift_y_int})")
+                corrected_image = np.roll(current_image_full_color, (shift_y_int, shift_x_int), axis=(0, 1))
+                if shift_y_int > 0: corrected_image[:shift_y_int, :] = 0
+                elif shift_y_int < 0: corrected_image[shift_y_int:, :] = 0
+                if shift_x_int > 0: corrected_image[:, :shift_x_int] = 0
+                elif shift_x_int < 0: corrected_image[:, shift_x_int:] = 0
+                image_changed = True
+
+            elif abs(rot_angle) > 1e-4:
+                current_total_rotation = target_info.get('total_rotation', 0.0)
+                new_total_rotation = current_total_rotation + rot_angle
+
+                image_to_rotate = target_info.get('image_orig', current_image_full_color)
+                if not image_to_rotate.flags['C_CONTIGUOUS']:
+                    image_to_rotate = np.ascontiguousarray(image_to_rotate)
+
+                logs.append(f"  Applying rotation delta: {rot_angle:.2f} deg (New Total: {new_total_rotation:.2f})")
+                rotated_im = _perform_cv_rotation(image_to_rotate, new_total_rotation)
+
+                if rotated_im is not None:
+                    corrected_image = rotated_im.astype(np.uint8)
+                    image_changed = True
+                else:
+                    logs.append(f"  Rotation failed for image {idx}.")
+                    return idx, current_ref_idx, None, None, False, logs
+            else:
+                logs.append(f"  Image {idx}: Calculated transform is zero.")
+
+            if corrected_image is None:
+                corrected_image = current_image_full_color.copy()
+
+            if self.sync_brightness:
+                logs.append(f"  Syncing brightness for image {idx} against ref {current_ref_idx}...")
+                corrected_image = match_brightness(corrected_image, ref_info['image'], self.anchor_details)
+                image_changed = True
+
+            if not image_changed:
+                corrected_image = None
+
+            return idx, current_ref_idx, corrected_image, new_total_rotation, True, logs
+
+        except Exception as e:
+            logs.append(f"Error registering image {idx} ('{target_name}'): {e}")
+            return idx, current_ref_idx, None, None, False, logs
+
     @pyqtSlot()
     def run(self):
         """The main registration loop executed in the thread."""
         self.log_message.emit(f"Starting registration ({self.reg_method})...")
         registered_count = 0
         errors = 0
-        num_to_process = len(self.indices_to_register)
-        total_images_in_list = len(self.image_data_list) # For context if needed
+        num_to_process = len(self.registration_pairs)
+
+        is_rolling = len(self.registration_pairs) > 1 and any(
+            self.registration_pairs[i][1] == self.registration_pairs[i - 1][0]
+            for i in range(1, len(self.registration_pairs))
+        )
 
         try:
-            for i, idx in enumerate(self.indices_to_register):
-                if self._is_cancelled:
-                    self.log_message.emit("Registration cancelled.")
-                    break # Exit the loop if cancelled
+            if is_rolling:
+                self.log_message.emit("Running sequential registration (rolling master mode)...")
+                for i, (idx, current_ref_idx) in enumerate(self.registration_pairs):
+                    if self._is_cancelled:
+                        self.log_message.emit("Registration cancelled.")
+                        break
 
-                image_info = self.image_data_list[idx]
-                image_name = image_info['name']
-                self.progress.emit(i + 1, num_to_process, image_name) # Progress: 1 to num_to_process
-                self.log_message.emit(f"--- Processing Image {idx + 1}/{total_images_in_list} ('{image_name}') ---")
+                    target_name = self.image_data_list[idx]['name']
+                    self.progress.emit(i + 1, num_to_process, target_name)
 
-                try:
-                    current_image_full_color = image_info['image'] # Use data passed to worker
-                    # Ensure it's contiguous for potential C-API calls (like in OpenCV)
-                    if not current_image_full_color.flags['C_CONTIGUOUS']:
-                        current_image_full_color = np.ascontiguousarray(current_image_full_color)
+                    idx, ref_idx, corrected_img, new_rot, success, logs = self._process_single_pair(idx, current_ref_idx)
+                    for msg in logs:
+                        self.log_message.emit(msg)
 
-                    current_grey = np.dot(current_image_full_color[..., :3].astype(np.float32), [0.2989, 0.5870, 0.1140])
-
-                    shift_x_int, shift_y_int = 0, 0
-                    rot_angle = 0.0 # Rotation delta for this image
-                    corrected_image = None # Store result here
-
-                    # --- Call appropriate registration method ---
-                    # Note: These _register_* functions are imported from image_functions
-                    if self.reg_method == 'fft':
-                        current_grey_reg = current_grey
-                        ref_grey_reg = self.ref_grey
-                        if self.ref_anchor is not None and self.anchor_details:
-                             y_start = self.anchor_details['y']
-                             y_end = y_start + self.anchor_details['h']
-                             x_start = self.anchor_details['x']
-                             x_end = x_start + self.anchor_details['w']
-                             # Check bounds before slicing
-                             if 0 <= y_start < y_end <= current_grey.shape[0] and \
-                                0 <= x_start < x_end <= current_grey.shape[1]:
-                                 current_grey_reg = current_grey[y_start:y_end, x_start:x_end]
-                                 ref_grey_reg = self.ref_anchor # Use pre-extracted anchor
-                             else:
-                                 self.log_message.emit(f"  Warning: Anchor out of bounds for image {idx}. Using full FFT.")
-                                 # Fallback to full image FFT if anchor is invalid for current image
-
-                        xoff, yoff = _register_fft(ref_grey_reg, current_grey_reg) # Pass data directly
-                        if xoff is not None and yoff is not None:
-                            shift_y_int = -int(round(yoff))
-                            shift_x_int = -int(round(xoff))
-                        else:
-                            self.log_message.emit(f"  FFT failed for image {idx}.")
-                            errors += 1
-                            continue
-
-                    elif self.reg_method == 'scan':
-                        if self.ref_anchor is None:
-                            self.log_message.emit(f"  Scan SSD requires an anchor. Skipping image {idx}.")
-                            errors += 1
-                            continue
-                        # Pass shift_val (step_size) to scan function
-                        # *** We need to adjust _register_scan_ssd to accept step_size ***
-                        # (This adjustment will be done in image_functions.py)
-                        xoff, yoff = _register_scan_ssd(self.ref_anchor, current_grey, self.anchor_details, self.shift_val)
-                        if xoff is not None and yoff is not None:
-                            shift_y_int = -yoff
-                            shift_x_int = -xoff
-                        else:
-                            self.log_message.emit(f"  Scan SSD failed for image {idx}.")
-                            errors += 1
-                            continue
-
-                    elif self.reg_method == 'scan_rot':
-                        if self.ref_anchor is None:
-                            self.log_message.emit(f"  Scan Rot requires an anchor. Skipping image {idx}.")
-                            errors += 1
-                            continue
-                        rot_delta = _register_scan_ssd_rot(self.ref_anchor, current_grey, self.anchor_details)
-                        if rot_delta is not None:
-                            rot_angle = rot_delta # Store the calculated rotation delta
-                        else:
-                            self.log_message.emit(f"  Scan Rot failed for image {idx}.")
-                            errors += 1
-                            continue
+                    if success:
+                        registered_count += 1
+                        if corrected_img is not None:
+                            self.image_data_list[idx]['image'] = corrected_img
+                            self.image_updated.emit(idx, ref_idx, corrected_img.copy())
+                        if new_rot is not None:
+                            self.rotation_updated.emit(idx, new_rot)
                     else:
-                         self.log_message.emit(f"  Unknown registration method: {self.reg_method}")
-                         errors += 1
-                         continue
+                        errors += 1
+            else:
+                max_workers = min(32, (os.cpu_count() or 4) + 4)
+                self.log_message.emit(f"Running parallel multi-core registration ({max_workers} worker threads)...")
 
+                def _pair_worker(pair):
+                    if self._is_cancelled:
+                        return None
+                    return self._process_single_pair(pair[0], pair[1])
 
-                    # --- Apply Calculated Transform ---
-                    if abs(shift_y_int) > 0 or abs(shift_x_int) > 0:
-                        self.log_message.emit(f"  Applying final shift (dX:{shift_x_int}, dY:{shift_y_int})")
-                        # Use the original full color image passed to the worker
-                        corrected_image = np.roll(current_image_full_color, (shift_y_int, shift_x_int), axis=(0, 1))
-                        # Fill edges
-                        if shift_y_int > 0: corrected_image[:shift_y_int, :] = 0
-                        elif shift_y_int < 0: corrected_image[shift_y_int:, :] = 0
-                        if shift_x_int > 0: corrected_image[:, :shift_x_int] = 0
-                        elif shift_x_int < 0: corrected_image[:, shift_x_int:] = 0
-                        # Emit the updated image data
-                        self.image_updated.emit(idx, corrected_image.copy()) # Send copy back
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [executor.submit(_pair_worker, pair) for pair in self.registration_pairs]
+                    for i, future in enumerate(futures):
+                        if self._is_cancelled:
+                            break
+                        res = future.result()
+                        if res is None:
+                            continue
+                        idx, ref_idx, corrected_img, new_rot, success, logs = res
+                        target_name = self.image_data_list[idx]['name']
+                        self.progress.emit(i + 1, num_to_process, target_name)
+                        for msg in logs:
+                            self.log_message.emit(msg)
 
-                    elif abs(rot_angle) > 1e-4: # Apply rotation if significant
-                         # Get the *original* rotation state passed in image_data_list
-                         current_total_rotation = image_info.get('total_rotation', 0.0)
-                         new_total_rotation = current_total_rotation + rot_angle # Apply delta
-
-                         # Determine the base image for rotation (prefer original if available)
-                         image_to_rotate = image_info.get('image_orig', current_image_full_color)
-                         if not image_to_rotate.flags['C_CONTIGUOUS']:
-                             image_to_rotate = np.ascontiguousarray(image_to_rotate)
-
-                         self.log_message.emit(f"  Applying rotation delta: {rot_angle:.2f} deg (New Total: {new_total_rotation:.2f})")
-                         rotated_im = _perform_cv_rotation(image_to_rotate, new_total_rotation)
-
-                         if rotated_im is not None:
-                             corrected_image = rotated_im.astype(np.uint8)
-                             # Emit the updated image data AND the new total rotation
-                             self.image_updated.emit(idx, corrected_image.copy())
-                             self.rotation_updated.emit(idx, new_total_rotation)
-                             # Also update 'image_orig' if it didn't exist before rotation
-                             if 'image_orig' not in image_info:
-                                 # This is tricky - the worker shouldn't modify the original list directly.
-                                 # The main thread should handle setting 'image_orig' upon receiving the first rotation update.
-                                 pass # Main thread will handle 'image_orig' creation
-                         else:
-                             self.log_message.emit(f"  Rotation failed for image {idx}.")
-                             errors += 1
-                             continue # Skip to next image if rotation failed
-                    else:
-                        self.log_message.emit(f"  Image {idx}: Calculated transform is zero, no change applied.")
-                        # No need to emit image_updated if no change
-
-                    registered_count += 1
-
-                except Exception as e:
-                    # Catch errors during processing of a single image
-                    error_msg = f"Error registering image {idx} ('{image_name}'): {e}"
-                    self.log_message.emit(error_msg)
-                    # self.error.emit(error_msg) # Maybe too noisy? Log is better.
-                    traceback.print_exc() # Log detailed traceback
-                    errors += 1
-            # --- End Loop ---
+                        if success:
+                            registered_count += 1
+                            if corrected_img is not None:
+                                self.image_data_list[idx]['image'] = corrected_img
+                                self.image_updated.emit(idx, ref_idx, corrected_img.copy())
+                            if new_rot is not None:
+                                self.rotation_updated.emit(idx, new_rot)
+                        else:
+                            errors += 1
 
         except Exception as e:
-            # Catch errors in the overall worker setup/loop logic
             error_msg = f"Critical error during registration worker execution: {e}"
             self.log_message.emit(error_msg)
             traceback.print_exc()
-            self.error.emit(error_msg) # Emit critical error signal
-            # Ensure finished is emitted even on critical error, but report counts
+            self.error.emit(error_msg)
             self.finished.emit(registered_count, errors + (num_to_process - registered_count - errors))
-            return # Stop execution
+            return
 
-        # --- Finished Signal ---
         if not self._is_cancelled:
             self.log_message.emit("--- Registration Finished ---")
             self.log_message.emit(f"Processed: {registered_count}, Errors: {errors}")
@@ -254,100 +382,98 @@ class MorphWorker(QObject):
         self.log_message.emit("Cancellation requested...")
         self._is_cancelled = True
 
+    def _process_morph_pair(self, idx, total_expected_frames):
+        """Generates interpolated frames for pair idx in parallel."""
+        if self._is_cancelled:
+            return 0, [f"Cancelled pair {idx + 1}"]
+
+        logs = []
+        logs.append(f'Processing morph pair {idx + 1}/{len(self.image_data_list) - 1}')
+        img1_data = self.image_data_list[idx]['image']
+        img2_data = self.image_data_list[idx + 1]['image']
+
+        start_counter = 1 + idx * self.frame_rate
+        generated = 0
+
+        if img1_data.shape != img2_data.shape:
+            logs.append(f"Shape mismatch between image {idx} and {idx + 1}. Skipping interpolation.")
+            padded_index = str(start_counter).zfill(5)
+            filename = f'{self.base_name}{padded_index}{self.save_ext}'
+            save_path = os.path.join(self.save_folder, filename)
+            imageio.imwrite(save_path, img2_data)
+            return 1, logs
+
+        img1 = img1_data.astype(np.float32)
+        img2 = img2_data.astype(np.float32)
+        num_steps = self.frame_rate - 1
+
+        for i in range(num_steps):
+            if self._is_cancelled:
+                break
+            alpha = (i + 1.0) / self.frame_rate
+            interp_img = np.clip(img1 * (1.0 - alpha) + img2 * alpha, 0, 255).astype(np.uint8)
+            padded_index = str(start_counter + i).zfill(5)
+            filename = f'{self.base_name}{padded_index}{self.save_ext}'
+            save_path = os.path.join(self.save_folder, filename)
+            imageio.imwrite(save_path, interp_img)
+            generated += 1
+
+        if not self._is_cancelled:
+            padded_index = str(start_counter + num_steps).zfill(5)
+            filename = f'{self.base_name}{padded_index}{self.save_ext}'
+            save_path = os.path.join(self.save_folder, filename)
+            imageio.imwrite(save_path, img2_data)
+            generated += 1
+
+        return generated, logs
+
     @pyqtSlot()
     def run(self):
         """The main morphing loop executed in the thread."""
         self.log_message.emit(f"Starting morph (FPS={self.frame_rate}) into: {self.save_folder} as '{self.base_name}*{self.save_ext}'")
-        counter = 0
         num_images = len(self.image_data_list)
         generated_count = 0
-        # Estimate total frames for progress bar:
-        # (num_images - 1) pairs * (frame_rate - 1) interpolated frames + num_images original frames
         total_expected_frames = (num_images - 1) * (self.frame_rate - 1) + num_images if num_images > 0 else 0
-        if total_expected_frames <= 0: total_expected_frames = 1 # Avoid division by zero
+        if total_expected_frames <= 0:
+            total_expected_frames = 1
 
         try:
             if num_images == 0:
-                 self.log_message.emit("No images to morph.")
-                 self.finished.emit(0)
-                 return
+                self.log_message.emit("No images to morph.")
+                self.finished.emit(0)
+                return
 
             # Save first frame
             img_first = self.image_data_list[0]['image']
-            padded_index = str(counter).zfill(5)
+            padded_index = "0".zfill(5)
             filename = f'{self.base_name}{padded_index}{self.save_ext}'
             save_path = os.path.join(self.save_folder, filename)
             imageio.imwrite(save_path, img_first)
             generated_count += 1
-            counter += 1
-            self.progress.emit(counter, total_expected_frames)
+            self.progress.emit(generated_count, total_expected_frames)
 
-            # Loop through pairs
-            for idx in range(num_images - 1):
-                if self._is_cancelled:
-                    self.log_message.emit("Morphing cancelled.")
-                    break
+            max_workers = min(32, (os.cpu_count() or 4) + 4)
+            self.log_message.emit(f"Running multi-core parallel morphing ({max_workers} worker threads)...")
 
-                self.log_message.emit(f'Processing pair {idx + 1}/{num_images-1}')
-                img1_data = self.image_data_list[idx]['image']
-                img2_data = self.image_data_list[idx + 1]['image']
-
-                # Check shape mismatch
-                if img1_data.shape != img2_data.shape:
-                    self.log_message.emit(f"Shape mismatch between image {idx} and {idx + 1}. Skipping interpolation, saving frame {idx + 1}.")
-                    # Save the second image directly as the next frame
-                    img_next = img2_data
-                    padded_index = str(counter).zfill(5)
-                    filename = f'{self.base_name}{padded_index}{self.save_ext}'
-                    save_path = os.path.join(self.save_folder, filename)
-                    imageio.imwrite(save_path, img_next)
-                    generated_count += 1
-                    counter += 1
-                    self.progress.emit(counter, total_expected_frames)
-                    continue # Move to the next pair
-
-                # Convert to float32 for interpolation
-                img1 = img1_data.astype(np.float32)
-                img2 = img2_data.astype(np.float32)
-
-                # Interpolate frames
-                num_steps = self.frame_rate - 1
-                for i in range(num_steps):
-                    if self._is_cancelled: break # Check inside inner loop too
-
-                    alpha = (i + 1.0) / self.frame_rate
-                    interp_img = np.clip(img1 * (1.0 - alpha) + img2 * alpha, 0, 255).astype(np.uint8)
-                    padded_index = str(counter).zfill(5)
-                    filename = f'{self.base_name}{padded_index}{self.save_ext}'
-                    save_path = os.path.join(self.save_folder, filename)
-                    imageio.imwrite(save_path, interp_img)
-                    generated_count += 1
-                    counter += 1
-                    self.progress.emit(counter, total_expected_frames)
-
-                if self._is_cancelled: break # Check after inner loop
-
-                # Save second image of pair (end frame)
-                img_second = img2_data # Use the original uint8 data
-                padded_index = str(counter).zfill(5)
-                filename = f'{self.base_name}{padded_index}{self.save_ext}'
-                save_path = os.path.join(self.save_folder, filename)
-                imageio.imwrite(save_path, img_second)
-                generated_count += 1
-                counter += 1
-                self.progress.emit(counter, total_expected_frames)
-
-            # --- End Loop ---
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(self._process_morph_pair, idx, total_expected_frames) for idx in range(num_images - 1)]
+                for future in futures:
+                    if self._is_cancelled:
+                        break
+                    pair_generated, logs = future.result()
+                    for log_msg in logs:
+                        self.log_message.emit(log_msg)
+                    generated_count += pair_generated
+                    self.progress.emit(generated_count, total_expected_frames)
 
         except Exception as e:
             error_msg = f"Critical error during morphing worker execution: {e}"
             self.log_message.emit(error_msg)
             traceback.print_exc()
             self.error.emit(error_msg)
-            self.finished.emit(generated_count) # Still emit finished
+            self.finished.emit(generated_count)
             return
 
-        # --- Finished Signal ---
         if not self._is_cancelled:
             self.log_message.emit(f"Finished morphing. Generated {generated_count} frames.")
         self.finished.emit(generated_count)
